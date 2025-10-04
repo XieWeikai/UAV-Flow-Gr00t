@@ -10,8 +10,8 @@ wheels/
 .venv
 
 # dataset
-UAVFlow/
 my-awesome-drone-dataset/
+UAVFlow*/
 
 **/*.mp4
 *.ipynb

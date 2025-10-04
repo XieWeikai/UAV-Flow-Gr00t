@@ -5,8 +5,7 @@ from pathlib import Path
 import shutil
 from PIL import Image
 import io
-
-from utils.trajectory import MultiParquetTrajectoryProcessor
+import argparse
 
 # Import the main class from the lerobot library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -16,16 +15,16 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 DROID_FEATURES = {
     # The language instruction for the task.
     "annotation.human.action.task_description": {
-        "dtype": "string",
+        "dtype": "int32", # index of task
         "shape": (1,),
         "names": None,
     },
     # The drone's internal state (e.g., from an IMU or flight controller).
-    "observation.state.drone": {
+    "observation.state": {
         "dtype": "float32",
-        "shape": (6,),
+        "shape": (1,), # our current UAV can not provide full 6-DoF state, this is a placeholder that always has the value [0]
         "names": {
-            "axes": ["x", "y", "z", "roll", "pitch", "yaw"],
+            "axes": ["ignore"],
         },
     },
     # The primary video feed from the drone's ego-centric camera.
@@ -39,7 +38,7 @@ DROID_FEATURES = {
         ],
     },
     # The action command sent to the drone.
-    "action.relative_position": {
+    "action": {
         "dtype": "float32",
         "shape": (4,),
         "names": {
@@ -48,17 +47,34 @@ DROID_FEATURES = {
     },
 }
 
+def parse_args():
+    """Parse CLI arguments for configuring dataset generation."""
+    parser = argparse.ArgumentParser(description="Generate a LeRobot dataset from UAVFlow trajectories.")
+    parser.add_argument("--repo-id", type=str, default="UAVFlowLeRobot", help="Output dataset repo/directory name.")
+    parser.add_argument("--fps", type=int, default=5, help="Target frames per second for the dataset.")
+    parser.add_argument("--data-path", type=str, default="./UAVFlow", help="Path to the source UAVFlow data directory.")
+    parser.add_argument("--robot-type", type=str, default="tello", help="Robot type identifier for LeRobot dataset.")
+    return parser.parse_args()
+
+
 def main():
     """
     Main function to generate a dummy LeRobot dataset.
     """
     # --- 1. Setup Paths and Parameters ---
+    args = parse_args()
+    # Defer heavy or optional imports until after parsing args so `--help` works without full deps
+    from utils.rotation import relative_pose_given_axes
+    from utils.trajectory import MultiParquetTrajectoryProcessor
 
     # Define the repository ID, which will also be the name of the output directory.
-    repo_id = "my-awesome-drone-dataset"
+    repo_id = args.repo_id
     # Set the root path where the dataset will be saved.
     root_path = Path("./") / repo_id
-    fps = 5
+    fps = args.fps
+    robot_type = args.robot_type
+    if fps <= 0:
+        raise ValueError("fps must be a positive integer")
     
     # Clean up the directory if it exists from a previous run.
     if root_path.exists():
@@ -73,25 +89,36 @@ def main():
         repo_id=repo_id,
         root=root_path,
         fps=fps,
-        robot_type="tello",
+        robot_type=robot_type,
         features=DROID_FEATURES
     )
 
     # --- 3. Generate and Add Trajectories ---
     
-    uav_flow_path = "./UAVFlow"
+    uav_flow_path = args.data_path
     uav_flow_dataset = MultiParquetTrajectoryProcessor.from_dir(uav_flow_path)
     
+    POSE_INDICES={"x": 0, "y": 1, "z": 2, "roll": 3, "pitch": 5, "yaw": 4}
+    
+    task_id = 0
     for _, traj_images, log in uav_flow_dataset:
         for instruction_key in ["instruction", "instruction_unified"]:
             task = log[instruction_key]
-            first_frame_timestamp = log['raw_logs'][0][-1]
             
+            last_timestamp = 0.0
+            added_frames = 0
             for frame_idx, img in traj_images:
-                frame_timestamp = log['raw_logs'][frame_idx][-1]
-                relative_time = frame_timestamp - first_frame_timestamp
+                curr_frame_timestamp = log['raw_logs'][frame_idx][-1]
+                if frame_idx > 0:
+                    delta_time = curr_frame_timestamp - last_timestamp
+                    last_timestamp = curr_frame_timestamp
+                    assert delta_time - 1.0 / fps < 1e-1, f"Frame interval {delta_time} does not match fps {fps}"
+                else:
+                    last_timestamp = curr_frame_timestamp
+                    
                 # state
-                state = np.array(log["preprocessed_logs"][frame_idx], dtype=np.float32)
+                # just a placeholder
+                state = np.array([0.0], dtype=np.float32)
 
                 # observation
                 image = Image.open(io.BytesIO(img))
@@ -100,24 +127,37 @@ def main():
                 ego_view = np.array(image)
                 
                 # action
-                # NOTE: 这个action需要特别处理
-                # 此处的action是每一帧相对于起始位置（trajectory中的第一帧）的相对位置
-                # 但实际希望的action是这一帧之后要怎么飞，即这一帧之后的位置和现在的相对位置
-                # 由于yaw也变了，所以x, y也不能直接相减，要以飞机当前视角来变换相对位置
-                # 这个相对位置根据当前帧的不同会有不同的变化，不是固定的
-                # 只能在data transform中计算，Gr00t中有相关transform
-                # 此处只能保留绝对位置，参考EmbodimentTag.OXE_DROID的data config
-                # 参考state_action.py中的RotationTransform
-                idx = [0, 1, 2, -1]
-                action = np.array([log["preprocessed_logs"][i] for i in idx], dtype=np.float32)
+                raw_logs = log['raw_logs']
+                last_frame_idx = max(0, frame_idx - 1)
+                last_pose = [raw_logs[last_frame_idx][i] for i in POSE_INDICES.values()]
+                curr_pose = [raw_logs[frame_idx][i] for i in POSE_INDICES.values()]
+                
+                action = relative_pose_given_axes(
+                    np.array(last_pose, dtype=np.float32), np.array(curr_pose, dtype=np.float32),
+                    axes=["x", "y", "z", "yaw"],
+                    degree=True
+                )
+                
+                action = action[[0, 1, 2, 5]].astype(np.float32) # x,y,z,yaw
 
                 # Add the processed data to the dataset
                 tds.add_frame({
-                    "annotation.human.action.task_description": task,
-                    "observation.state.drone": state,
+                    "annotation.human.action.task_description": np.array([task_id], dtype=np.int32),
+                    "observation.state": state,
                     "video.ego_view": ego_view,
-                    "action.relative_position": action,
-                })
+                    "action": action,
+                }, task)
+                added_frames += 1
+                
+            if added_frames > 0:
+                task_id += 1
+                
+                print(f"saved trajectory with {frame_idx+1} frames, task: {task}")
+                tds.save_episode()
+            n = 2
+            if task_id >= n:
+                print(f"Demo finished; processed {n} trajectories.")
+                return
 
 
 if __name__ == "__main__":

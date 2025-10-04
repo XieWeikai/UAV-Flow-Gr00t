@@ -83,200 +83,6 @@ def array_to_dict(arr: np.array) -> dict:
     return {key: arr[i] * sign[key] for i, key in enumerate(indices.keys())}
 
 
-def calculate_relative_pose(p1_coords, p2_coords):
-    """
-    计算 P2 相对于 P1 坐标系的位姿。
-
-    参数:
-    p1_coords (dict): P1 的坐标，包含 'x', 'y', 'z', 'roll', 'pitch', 'yaw'
-                      单位: m, °
-    p2_coords (dict): P2 的坐标，同样包含 'x', 'y', 'z', 'roll', 'pitch', 'yaw'
-                      单位: m, °
-
-    返回:
-    dict: P2 相对于 P1 的坐标，包含 'x', 'y', 'z', 'roll', 'pitch', 'yaw'
-    """
-    
-    # --- 1. 提取并准备数据 ---
-    
-    # 提取 P1 的位置和姿态
-    pos1 = np.array([p1_coords['x'], p1_coords['y'], p1_coords['z']])
-    # scipy 的 Rotation 类默认使用 ZYX 顺序，即 yaw, pitch, roll
-    # 注意：这里的 'zyx' 指的是内旋（intrinsic），等价于固定的 XYZ 轴（extrinsic）的外旋。
-    # 这与我们 R = Rz * Ry * Rx 的定义是一致的。
-    rot1 = R.from_euler('zyx', [p1_coords['yaw'], p1_coords['pitch'], p1_coords['roll']], degrees=True)
-
-    # 提取 P2 的位置和姿态
-    pos2 = np.array([p2_coords['x'], p2_coords['y'], p2_coords['z']])
-    rot2 = R.from_euler('zyx', [p2_coords['yaw'], p2_coords['pitch'], p2_coords['roll']], degrees=True)
-    
-    # --- 2. 计算相对位置 ---
-    
-    # 在世界坐标系中计算从 P1 到 P2 的向量
-    delta_pos_world = pos2 - pos1
-    
-    # 获取 P1 的逆旋转。这会将世界坐标系中的向量转换到 P1 的局部坐标系中。
-    rot1_inv = rot1.inv()
-    
-    # 将 delta_pos_world 向量旋转到 P1 的坐标系中
-    relative_pos = rot1_inv.apply(delta_pos_world)
-
-    # --- 3. 计算相对姿态 ---
-    
-    # 相对旋转 = P1的逆旋转 * P2的旋转
-    # R_rel = R1_inv * R2
-    relative_rot = rot1_inv * rot2
-    
-    # 从相对旋转中提取欧拉角（yaw, pitch, roll），单位为度
-    relative_euler = relative_rot.as_euler('zyx', degrees=True)
-    relative_yaw, relative_pitch, relative_roll = relative_euler
-    
-    # --- 4. 格式化输出 ---
-    
-    relative_pose = {
-        'x': relative_pos[0],
-        'y': relative_pos[1],
-        'z': relative_pos[2],
-        'roll': relative_roll,
-        'pitch': relative_pitch,
-        'yaw': relative_yaw,
-    }
-    
-    return relative_pose
-
-def calculate_relative_pose_for_drone_control(
-    p1_coords,
-    p2_coords,
-    orientation_axes: str | Iterable[str] | None = 'yaw',
-):
-    """
-    Compute the relative pose for drone control (4-DoF simplified model).
-
-    By default, the position transform only considers P1's yaw (heading),
-    matching the prior behavior. You can choose any combination of roll/pitch/yaw
-    to be applied to the XYZ transform by setting `orientation_axes`.
-
-    Args:
-        p1_coords (dict): Pose of P1 with keys 'x','y','z','roll','pitch','yaw' (units: m, degrees)
-        p2_coords (dict): Pose of P2 with the same keys (units: m, degrees)
-        orientation_axes (str | Iterable[str] | None): Which orientation components of P1
-            to include when rotating the position vector from world into P1's body frame.
-            Accepts:
-              - strings: 'yaw', 'pitch', 'roll', any combo like 'zyx', 'zy', 'x', etc.
-              - iterables: ['yaw','pitch'], ('roll',), {'z','y'}
-              - None / '' / 'none' means no rotation (identity)
-            Rotation order is intrinsic ZYX (yaw, then pitch, then roll), filtered by the
-            selected components. For example, selecting {'yaw','pitch'} yields sequence 'zy'.
-
-    Returns:
-        dict: Relative pose of P2 in P1's frame with keys 'x','y','z','roll','pitch','yaw'.
-    """
-    if isinstance(orientation_axes, str):
-        orientation_axes = [orientation_axes]
-    # --- Normalize axis selection ---
-    def _normalize_axes(sel: str | Iterable[str] | None) -> str:
-        if sel is None:
-            return ''
-        if isinstance(sel, str):
-            s = sel.strip().lower()
-            if s in ('', 'none', 'identity', 'i'):
-                return ''
-            # Replace semantic names with axis letters
-            s = (
-                s.replace('yaw', 'z')
-                 .replace('pitch', 'y')
-                 .replace('roll', 'x')
-            )
-            # Keep only x/y/z letters
-            letters = [ch for ch in s if ch in {'x','y','z'}]
-            # Build sequence in intrinsic ZYX order
-            ordered = ''.join([ax for ax in 'zyx' if ax in letters])
-            return ordered
-        # Iterable of names
-        try:
-            items = list(sel)
-        except TypeError:
-            raise ValueError("orientation_axes must be a string, an iterable of axis names, or None")
-        mapped = []
-        for item in items:
-            name = str(item).strip().lower()
-            if name in ('z', 'yaw'):
-                mapped.append('z')
-            elif name in ('y', 'pitch'):
-                mapped.append('y')
-            elif name in ('x', 'roll'):
-                mapped.append('x')
-            else:
-                raise ValueError(f"Invalid axis in orientation_axes: {item}")
-        # Remove duplicates, honor ZYX order
-        unique = set(mapped)
-        return ''.join([ax for ax in 'zyx' if ax in unique])
-
-    axes_seq = _normalize_axes(orientation_axes)
-
-    # --- 1. 提取数据 ---
-    pos1 = np.array([p1_coords['x'], p1_coords['y'], p1_coords['z']])
-    pos2 = np.array([p2_coords['x'], p2_coords['y'], p2_coords['z']])
-
-    # --- 2. Compute relative position in the selected orientation frame ---
-    
-    # 在世界坐标系中计算从 P1 到 P2 的向量
-    delta_pos_world = pos2 - pos1
-    
-    # Build rotation from P1 using selected axes (intrinsic ZYX order filtered by axes_seq)
-    if axes_seq == '':
-        rot1_sel_inv = R.identity()
-    else:
-        # Map P1 angles to ZYX order
-        angles_map = {
-            'z': p1_coords['yaw'],
-            'y': p1_coords['pitch'],
-            'x': p1_coords['roll'],
-        }
-        angles = [angles_map[ax] for ax in axes_seq]
-        rot1_sel_inv = R.from_euler(axes_seq, angles, degrees=True).inv()
-        angles_map = {
-            'z': p2_coords['yaw'],
-            'y': p2_coords['pitch'],
-            'x': p2_coords['roll'],
-        }
-    
-    # Rotate the world displacement vector into this selected-orientation frame
-    relative_pos = rot1_sel_inv.apply(delta_pos_world)
-
-    # --- 3. Compute relative orientation ---
-    p1_pose = [
-        p1_coords['yaw'] if 'yaw' in orientation_axes else 0.0,
-        p1_coords['pitch'] if 'pitch' in orientation_axes else 0.0,
-        p1_coords['roll'] if 'roll' in orientation_axes else 0.0
-    ]
-    
-    p2_pose = [
-        p2_coords['yaw'] if 'yaw' in orientation_axes else 0.0,
-        p2_coords['pitch'] if 'pitch' in orientation_axes else 0.0,
-        p2_coords['roll'] if 'roll' in orientation_axes else 0.0
-    ]
-    
-    rot1 = R.from_euler('zyx', p1_pose, degrees=True)
-    rot2 = R.from_euler('zyx', p2_pose, degrees=True)
-    relative_rot = rot1.inv() * rot2
-    relative_euler = relative_rot.as_euler('zyx', degrees=True)
-    relative_yaw, relative_pitch, relative_roll = relative_euler
-    
-    # --- 4. 格式化输出 ---
-    # print(f"relative_pos: {relative_pos}")
-    relative_pos = relative_pos[0] if relative_pos.ndim > 1 else relative_pos
-    relative_pose = {
-        'x': relative_pos[0],
-        'y': relative_pos[1],
-        'z': relative_pos[2],
-        'roll': relative_roll,
-        'pitch': relative_pitch,
-        'yaw': relative_yaw,
-    }
-    
-    return relative_pose
-
 # copy from UAV-Flow
 # https://github.com/buaa-colalab/UAV-Flow/blob/0114801f585a29296be6d035d67401abeabd26d3/OpenVLA-UAV/prismatic/vla/datasets/uav_dataset.py#L167
 def _transform_to_local_frame(current_pose: np.ndarray, next_pose: np.ndarray) -> np.ndarray:
@@ -356,32 +162,60 @@ if __name__ == '__main__':
     with open(example_path, "r") as f:
         data = json.load(f)
         
-    # 读取前两帧数据进行测试
     absolute_poses = data["raw_logs"]
-    relative_poses = data["preprocessed_logs"]
-
-    P1 = {key: absolute_poses[1][indices[key]] * sign[key] for key in indices}
-    print_pose(P1, label="P1 in World Frame")
     
-    P2 = {key: absolute_poses[2][indices[key]] * sign[key] for key in indices}
-    print_pose(P2, label="P2 in World Frame")
+    length = len(absolute_poses)
+    print(f"Total frames in example data: {length}\n")
+    for i in range(length - 1):
+        P1 = {key: absolute_poses[i][indices[key]] * sign[key] for key in indices}
+        P2 = {key: absolute_poses[i + 1][indices[key]] * sign[key] for key in indices}
+        print(f"--- Frame {i} to Frame {i+1} ---")
+        print_pose(P1, label="P1 in World Frame")
+        print_pose(P2, label="P2 in World Frame")
 
-    relative_p2 = array_to_dict(relative_pose(dict_to_array(P1), dict_to_array(P2), degree=True))
+        relative_p2 = array_to_dict(relative_pose(dict_to_array(P1), dict_to_array(P2), degree=True))
 
-    print_pose(relative_p2, label="P2 relative to P1 (calculated)")
+        print_pose(relative_p2, label="P2 relative to P1 (calculated)")
 
-    drone_relative_p2 = array_to_dict(relative_pose_given_axes(
-        dict_to_array(P1), dict_to_array(P2), 
-        axes=["x", "y", "z", "yaw"],
-        degree=True
-    ))
-    #calculate_relative_pose_for_drone_control(P1, P2, orientation_axes=['yaw'])
-    print_pose(drone_relative_p2, label="P2 relative to P1 ignoring roll/pitch (calculated)")
+        drone_relative_p2 = array_to_dict(relative_pose_given_axes(
+            dict_to_array(P1), dict_to_array(P2), 
+            axes=["x", "y", "z", "yaw"],
+            degree=True
+        ))
+        print_pose(drone_relative_p2, label="P2 relative to P1 ignoring roll/pitch (calculated)")
+        
+        relative_p2_uavflow = UAV_Flow_relative_pose(P1, P2)
+        print_pose(relative_p2_uavflow, label="P2 relative to P1 (UAV-Flow method)")
+        
+        assert np.allclose(
+            [drone_relative_p2[k] for k in ["x", "y", "z", "yaw"]],
+            [relative_p2_uavflow[k] for k in ["x", "y", "z", "yaw"]],
+            atol=1e-6
+        ), "Mismatch between calculated and UAV-Flow method!"
     
-    relative_p2_uavflow = UAV_Flow_relative_pose(P1, P2)
-    print_pose(relative_p2_uavflow, label="P2 relative to P1 (UAV-Flow method)")
+    # print a green success message
+    print("All frames processed successfully! Calculated relative poses match UAV-Flow method.")
     
-    # relative_p2_expected = {key: relative_poses[1][indices[key]] * sign[key] for key in indices}
-    # print_pose(relative_p2_expected, label="P2 relative to P1 (expected)")
+    # relative_poses = data["preprocessed_logs"]
+
+    # P1 = {key: absolute_poses[1][indices[key]] * sign[key] for key in indices}
+    # print_pose(P1, label="P1 in World Frame")
+    
+    # P2 = {key: absolute_poses[2][indices[key]] * sign[key] for key in indices}
+    # print_pose(P2, label="P2 in World Frame")
+
+    # relative_p2 = array_to_dict(relative_pose(dict_to_array(P1), dict_to_array(P2), degree=True))
+
+    # print_pose(relative_p2, label="P2 relative to P1 (calculated)")
+
+    # drone_relative_p2 = array_to_dict(relative_pose_given_axes(
+    #     dict_to_array(P1), dict_to_array(P2), 
+    #     axes=["x", "y", "z", "yaw"],
+    #     degree=True
+    # ))
+    # print_pose(drone_relative_p2, label="P2 relative to P1 ignoring roll/pitch (calculated)")
+    
+    # relative_p2_uavflow = UAV_Flow_relative_pose(P1, P2)
+    # print_pose(relative_p2_uavflow, label="P2 relative to P1 (UAV-Flow method)")
 
     

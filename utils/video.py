@@ -1,134 +1,200 @@
-#!/usr/bin/env python
+# VideoBuilder class for building mp4 videos from images
+from typing import List, Union
+from PIL import Image
 
+class VideoBuilder:
+    def __init__(self, fps: int, width: int, height: int) -> None:
+        """
+        Initialize the VideoBuilder.
+        Args:
+            fps (int): Frames per second for the output video.
+            width (int): Width of the video frames.
+            height (int): Height of the video frames.
+        """
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.frames: List[np.ndarray] = []
+
+    def add_frame(self, image: Union[np.ndarray, Image.Image]) -> None:
+        """
+        Add an image frame to the video.
+        Args:
+            image (Union[np.ndarray, PIL.Image.Image]): Image to add (will be resized to (width, height) if needed).
+        """
+        if isinstance(image, Image.Image):
+            image = np.array(image.convert('RGB'))
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        if image.shape[1] != self.width or image.shape[0] != self.height:
+            image = cv2.resize(image, (self.width, self.height))
+        self.frames.append(image)
+
+    def save(self, output_path: str) -> None:
+        """
+        Save the added frames as an mp4 video and clear the frame buffer.
+        Args:
+            output_path (str): Path to save the mp4 video file.
+        """
+        if not self.frames:
+            print("No frames to save.")
+            return
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, self.fps, (self.width, self.height))
+        for frame in self.frames:
+            writer.write(frame)
+        writer.release()
+        self.frames.clear()
+        print(f"Video saved to {output_path} and frame buffer cleared.")
+# -*- coding: utf-8 -*-
+
+import cv2
 import numpy as np
-from pathlib import Path
-import shutil
 
-# Import the main class from the lerobot library
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-# Define the features (schema) for our drone dataset.
-# This structure tells the dataset writer what kind of data to expect.
-DROID_FEATURES = {
-    # The language instruction for the task.
-    "annotation.human.action.task_description": {
-        "dtype": "string",
-        "shape": (1,),
-        "names": None,
-    },
-    # The drone's internal state (e.g., from an IMU or flight controller).
-    "observation.state.drone": {
-        "dtype": "float32",
-        "shape": (6,),
-        "names": {
-            "axes": ["x", "y", "z", "roll", "pitch", "yaw"],
-        },
-    },
-    # The primary video feed from the drone's ego-centric camera.
-    "video.ego_view": {
-        "dtype": "video",
-        "shape": (256, 256, 3),
-        "names": [
-            "height",
-            "width",
-            "channels",
-        ],
-    },
-    # The action command sent to the drone.
-    "action.relative_position": {
-        "dtype": "float32",
-        "shape": (4,),
-        "names": {
-            "axes": ["x", "y", "z", "yaw"],
-        },
-    },
-}
-
-def main():
+def project_trajectory_to_image(
+    image: np.ndarray,
+    trajectory_points: list[list[float]],
+    K: np.ndarray
+) -> np.ndarray:
     """
-    Main function to generate a dummy LeRobot dataset.
+    Project 3D trajectory points in the FLU world coordinate system onto the image.
+
+    Args:
+        image (np.ndarray): The image to draw the trajectory on (OpenCV BGR format)
+        trajectory_points (list[list[float]]): List of trajectory points in the format [[x, y, z, yaw], ...]
+        K (np.ndarray): 3x3 camera intrinsic matrix
+
+    Returns:
+        image_with_trajectory (np.ndarray): Image with the trajectory drawn
     """
-    # --- 1. Setup Paths and Parameters ---
-
-    # Define the repository ID, which will also be the name of the output directory.
-    repo_id = "my-awesome-drone-dataset"
-    # Set the root path where the dataset will be saved.
-    root_path = Path("./") / repo_id
-    fps = 5
+    # Copy the image to avoid modifying the original
+    image_with_trajectory = image.copy()
+    h, w, _ = image_with_trajectory.shape
     
-    # Clean up the directory if it exists from a previous run.
-    if root_path.exists():
-        print(f"Removing existing directory: {root_path}")
-        shutil.rmtree(root_path)
-
-    # --- 2. Initialize the LeRobotDataset object ---
+    # Extract parameters from the intrinsic matrix
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
     
-    # Use LeRobotDataset.create to set up an empty dataset with our desired schema.
-    print(f"Initializing dataset at: {root_path}")
-    tds = LeRobotDataset.create(
-        repo_id=repo_id,
-        root=root_path,
-        fps=fps,
-        robot_type="tello",
-        features=DROID_FEATURES
-    )
+    projected_points = []
 
-    # --- 3. Generate and Add Dummy Trajectories ---
+    for point in trajectory_points:
+        x_w, y_w, z_w, _ = point  # yaw is not used here
 
-    num_trajectories = 4
-    num_frames_per_trajectory = 10
+        # Step 1: Coordinate transformation (FLU World -> RDF Camera)
+        # FLU (X: forward, Y: left, Z: up) -> RDF (X: right, Y: down, Z: forward)
+        x_c = -y_w
+        y_c = -z_w
+        z_c = x_w
 
-    # The main loop iterates to create each trajectory (episode).
-    timestamp = 0.0
-    for episode_idx in range(num_trajectories):
-        print(f"\nGenerating trajectory {episode_idx + 1}/{num_trajectories}...")
-        
-        # A dummy task description, unique for each episode.
-        task_description = f"Dummy task number {episode_idx}"
-        
-        # The inner loop creates each frame within a single trajectory.
-        for frame_idx in range(num_frames_per_trajectory):
-            # Generate dummy data for each feature.
-            
-            # State: 6 random float values.
-            dummy_state = np.random.randn(6).astype(np.float32)
-            
-            # Image: A 256x256 RGB image. We create a simple gradient.
-            r, g, b = np.mgrid[0:256, 0:256, 0:1]
-            r = np.full((256, 256, 1), fill_value=frame_idx * 10, dtype=np.uint8) # Red channel changes with frame
-            g = np.full((256, 256, 1), fill_value=episode_idx * 50, dtype=np.uint8) # Green channel changes with episode
-            b = np.zeros((256, 256, 1), dtype=np.uint8)
-            dummy_image = np.concatenate([r, g, b], axis=2)
+        # Step 2: Check if the point is in front of the camera
+        if z_c <= 0.1:  # Add a small threshold to avoid division by zero or projecting points behind the camera
+            continue
 
-            # Action: 4 random float values.
-            dummy_action = np.random.randn(4).astype(np.float32)
-            
-            # Assemble the frame dictionary. The keys MUST match DROID_FEATURES.
-            frame = {
-                "annotation.human.action.task_description": task_description,
-                "observation.state.drone": dummy_state,
-                "video.ego_view": dummy_image,
-                "action.relative_position": dummy_action,
-            }
-            
-            # frame["task"] = task_description
-            # frame["observation.state"] = dummy_image
-            # frame["action"] = dummy_action
-            
-            # Add the generated frame to the dataset's internal buffer.
-            tds.add_frame(frame, task_description, timestamp)
-            # Increment the timestamp for the next frame.
-            timestamp += 1.0 / fps
-            
-        # After all frames for one episode are added, save the episode to disk.
-        # This writes the .parquet and .mp4 files for this specific episode.
-        print(f"Saving trajectory {episode_idx + 1}...")
-        tds.save_episode()
+        # Step 3: 3D to 2D projection
+        u = int(fx * (x_c / z_c) + cx)
+        v = int(fy * (y_c / z_c) + cy)
 
-    print(f"\n✅ Successfully created dataset with {num_trajectories} trajectories.")
-    print(f"   Check the output files in the '{root_path}' directory.")
+        # Step 4: Check if the point is within the image bounds
+        if 0 <= u < w and 0 <= v < h:
+            projected_points.append((u, v))
+
+    # Step 5: Visualize the trajectory
+    # Draw trajectory lines (color gradient from far to near to better express depth)
+    num_points = len(projected_points)
+    for i in range(num_points - 1):
+        # Green intensity from 100 to 255
+        green_intensity = int(100 + 155 * (i / max(1, num_points - 1)))
+        color = (0, green_intensity, 0)
+        cv2.line(image_with_trajectory, projected_points[i], projected_points[i+1], color, 2)
+
+    # Draw trajectory points
+    for pt in projected_points:
+        cv2.circle(image_with_trajectory, pt, 3, (0, 0, 255), -1)  # Red solid circle
+
+    return image_with_trajectory
 
 
-if __name__ == "__main__":
-    main()
-    
+def get_intrinsics(
+    W: int,
+    H: int,
+    fov_x_deg: float = 84,
+    fov_y_deg: float | None = None
+) -> np.ndarray:
+    """Construct camera intrinsic matrix K"""
+    fov_x = np.deg2rad(fov_x_deg)
+    if fov_y_deg is None:
+        fov_y = 2 * np.arctan((H / W) * np.tan(fov_x / 2))
+    else:
+        fov_y = np.deg2rad(fov_y_deg)
+
+    fx = W / (2 * np.tan(fov_x / 2))
+    fy = H / (2 * np.tan(fov_y / 2))
+    cx = W / 2
+    cy = H / 2
+
+    K = np.array([[fx, 0, cx],
+                  [0, fy, cy],
+                  [0,  0, 1]])
+    return K
+
+
+# --- Main program ---
+if __name__ == '__main__':
+    # 1. Define camera and image parameters
+    # DJI Mavic 3T thermal camera parameters (estimated from public data)
+    ORIGINAL_WIDTH = 640
+    ORIGINAL_HEIGHT = 512
+    # Pixel pitch 12μm -> sensor width = 640 * 0.012mm
+    SENSOR_WIDTH_MM = 7.68
+    FOCAL_LENGTH_MM = 9.1
+
+    # Your dataset image size (after center crop)
+    CROP_WIDTH = 256
+    CROP_HEIGHT = 256
+
+    # 2. Calculate the intrinsic matrix after cropping
+    # K_matrix = calculate_intrinsics_for_crop(
+    #     ORIGINAL_WIDTH, ORIGINAL_HEIGHT, SENSOR_WIDTH_MM, FOCAL_LENGTH_MM, CROP_WIDTH, CROP_HEIGHT
+    # )
+    # print("\nCalculated intrinsic matrix K after center crop:")
+    K_matrix = get_intrinsics(CROP_WIDTH, CROP_HEIGHT, fov_x_deg=84)
+    print(K_matrix)
+
+    # 3. Load your image
+    # Note: Replace 'path_to_your_image.jpg' with your actual image path
+    # Here we create a black placeholder image for demonstration
+    image_path = 'path_to_your_image.jpg'
+    ego_view_image = cv2.imread(image_path)
+
+    if ego_view_image is None:
+        print(f"\nWarning: Unable to load image '{image_path}', using a black placeholder image.")
+        ego_view_image = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
+    else:
+        # Ensure the image size is correct
+        if ego_view_image.shape[0] != CROP_HEIGHT or ego_view_image.shape[1] != CROP_WIDTH:
+            print(f"Warning: Your image size is {ego_view_image.shape[:2]}, resizing to ({CROP_HEIGHT}, {CROP_WIDTH}).")
+            ego_view_image = cv2.resize(ego_view_image, (CROP_WIDTH, CROP_HEIGHT))
+
+    # 4. Define a sample trajectory (FLU coordinate system: forward, left, up), unit: meter
+    # The trajectory first flies forward, then left, then up
+    # (x: forward, y: left, z: up)
+    trajectory_flu = [
+        [0, 0, 0, 0],      # Start point
+        [15, 3, 0.2, 0],  # 15m forward, 3m left, slight climb
+        [20, 1, 0, 0],     # 20m forward, 1m left, back to level
+        [25, -2, 0.2, 0],  # 25m forward, 2m right (y negative), slight climb
+        [30, -3, 0.5, 0],  # 30m forward, 3m right, continue climbing
+        [35, -1, 1.0, 0],  # 35m forward, 1m right, climb to 1m
+        [40, 0, 1.5, 0],   # 40m forward, back to center, climb to 1.5m
+    ]
+
+    # 5. Perform projection and visualization
+    result_image = project_trajectory_to_image(ego_view_image, trajectory_flu, K_matrix)
+
+    # 6. Show the result
+    # cv2.imshow('Drone Trajectory Projection (Cropped Image)', result_image)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+    # Optional: Save the result image
+    cv2.imwrite('trajectory_visualization_cropped.png', result_image)

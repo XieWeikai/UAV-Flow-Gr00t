@@ -1,6 +1,9 @@
 # VideoBuilder class for building mp4 videos from images
 from typing import List, Union
 from PIL import Image
+import io
+import numpy as np
+import cv2
 
 class VideoBuilder:
     def __init__(self, fps: int, width: int, height: int) -> None:
@@ -107,9 +110,19 @@ def project_trajectory_to_image(
         color = (0, green_intensity, 0)
         cv2.line(image_with_trajectory, projected_points[i], projected_points[i+1], color, 2)
 
-    # Draw trajectory points
-    for pt in projected_points:
-        cv2.circle(image_with_trajectory, pt, 3, (0, 0, 255), -1)  # Red solid circle
+
+    # Draw trajectory points with color gradient: blue (start) -> red (end)
+    for idx, pt in enumerate(projected_points):
+        if num_points > 1:
+            ratio = idx / (num_points - 1)
+        else:
+            ratio = 0
+        # Interpolate from blue to red
+        r = int(ratio * 255)
+        g = 0
+        b = int((1 - ratio) * 255)
+        color = (b, g, r)  # OpenCV uses BGR
+        cv2.circle(image_with_trajectory, pt, 3, color, -1)
 
     return image_with_trajectory
 
@@ -140,61 +153,102 @@ def get_intrinsics(
 
 # --- Main program ---
 if __name__ == '__main__':
-    # 1. Define camera and image parameters
-    # DJI Mavic 3T thermal camera parameters (estimated from public data)
-    ORIGINAL_WIDTH = 640
-    ORIGINAL_HEIGHT = 512
-    # Pixel pitch 12μm -> sensor width = 640 * 0.012mm
-    SENSOR_WIDTH_MM = 7.68
-    FOCAL_LENGTH_MM = 9.1
+    import os, sys, pathlib
+    
+    PATH = pathlib.Path(__file__).parent
+    sys.path.append(str(PATH.parent))
+    
+    from utils.trajectory import TrajectoryProcessor
+    from utils.rotation import relative_pose_given_axes
+    file_path = '/home/shrelic/T7/UAV-Flow/train-00053-of-00054.parquet'
+    processor = TrajectoryProcessor(file_path)
 
-    # Your dataset image size (after center crop)
-    CROP_WIDTH = 256
-    CROP_HEIGHT = 256
+    builder = VideoBuilder(fps=5, width=256, height=256)
+    
+    HORIZON = 10  # Number of future points to visualize
+    K = get_intrinsics(256, 256, fov_x_deg=84)
+    num_videos = 0
+    num_videos_to_save = 5  # Limit to first n trajectories for demonstration
+    for traj_id, images_iterator, log_data in processor:
+        # Process each trajectory here
+        raw_log = log_data["raw_logs"]
+        task = log_data.get("instruction", "unknown")
+        for idx, img_bytes in images_iterator:
+            # Convert bytes to numpy array
+            image = Image.open(io.BytesIO(img_bytes))
+            curr_pose = np.array(raw_log[idx])[[0,1,2,3,5,4]]
+            future_points = []
+            for future_idx in range(idx, min(idx + HORIZON, len(raw_log))):
+                future_pose = np.array(raw_log[future_idx])[[0,1,2,3,5,4]]
+                delta_pose = relative_pose_given_axes(curr_pose, future_pose, axes=["x", "y", "z", "yaw"], degree=True)
+                x, y, z, _, _, yaw = delta_pose
+                x, y, z = x, -y, -z # 这里我搞错了，飞机是FRD而不是FLU
+                future_points.append([x, y, z, yaw])
+            projected_image = project_trajectory_to_image(np.array(image)[:, :, ::-1], future_points, K)
+            builder.add_frame(projected_image)
+        
+        with open("traj.txt", "a") as f:
+            f.write(f"Trajectory ID: {traj_id}, Task: {task}, Frames: {len(raw_log)}\n")
+        builder.save(f"trajectory_{traj_id}.mp4")
+        num_videos += 1
+        if num_videos >= num_videos_to_save:
+            break
 
-    # 2. Calculate the intrinsic matrix after cropping
-    # K_matrix = calculate_intrinsics_for_crop(
-    #     ORIGINAL_WIDTH, ORIGINAL_HEIGHT, SENSOR_WIDTH_MM, FOCAL_LENGTH_MM, CROP_WIDTH, CROP_HEIGHT
-    # )
-    # print("\nCalculated intrinsic matrix K after center crop:")
-    K_matrix = get_intrinsics(CROP_WIDTH, CROP_HEIGHT, fov_x_deg=84)
-    print(K_matrix)
+    # # 1. Define camera and image parameters
+    # # DJI Mavic 3T thermal camera parameters (estimated from public data)
+    # ORIGINAL_WIDTH = 640
+    # ORIGINAL_HEIGHT = 512
+    # # Pixel pitch 12μm -> sensor width = 640 * 0.012mm
+    # SENSOR_WIDTH_MM = 7.68
+    # FOCAL_LENGTH_MM = 9.1
 
-    # 3. Load your image
-    # Note: Replace 'path_to_your_image.jpg' with your actual image path
-    # Here we create a black placeholder image for demonstration
-    image_path = 'path_to_your_image.jpg'
-    ego_view_image = cv2.imread(image_path)
+    # # Your dataset image size (after center crop)
+    # CROP_WIDTH = 256
+    # CROP_HEIGHT = 256
 
-    if ego_view_image is None:
-        print(f"\nWarning: Unable to load image '{image_path}', using a black placeholder image.")
-        ego_view_image = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
-    else:
-        # Ensure the image size is correct
-        if ego_view_image.shape[0] != CROP_HEIGHT or ego_view_image.shape[1] != CROP_WIDTH:
-            print(f"Warning: Your image size is {ego_view_image.shape[:2]}, resizing to ({CROP_HEIGHT}, {CROP_WIDTH}).")
-            ego_view_image = cv2.resize(ego_view_image, (CROP_WIDTH, CROP_HEIGHT))
+    # # 2. Calculate the intrinsic matrix after cropping
+    # # K_matrix = calculate_intrinsics_for_crop(
+    # #     ORIGINAL_WIDTH, ORIGINAL_HEIGHT, SENSOR_WIDTH_MM, FOCAL_LENGTH_MM, CROP_WIDTH, CROP_HEIGHT
+    # # )
+    # # print("\nCalculated intrinsic matrix K after center crop:")
+    # K_matrix = get_intrinsics(CROP_WIDTH, CROP_HEIGHT, fov_x_deg=84)
+    # print(K_matrix)
 
-    # 4. Define a sample trajectory (FLU coordinate system: forward, left, up), unit: meter
-    # The trajectory first flies forward, then left, then up
-    # (x: forward, y: left, z: up)
-    trajectory_flu = [
-        [0, 0, 0, 0],      # Start point
-        [15, 3, 0.2, 0],  # 15m forward, 3m left, slight climb
-        [20, 1, 0, 0],     # 20m forward, 1m left, back to level
-        [25, -2, 0.2, 0],  # 25m forward, 2m right (y negative), slight climb
-        [30, -3, 0.5, 0],  # 30m forward, 3m right, continue climbing
-        [35, -1, 1.0, 0],  # 35m forward, 1m right, climb to 1m
-        [40, 0, 1.5, 0],   # 40m forward, back to center, climb to 1.5m
-    ]
+    # # 3. Load your image
+    # # Note: Replace 'path_to_your_image.jpg' with your actual image path
+    # # Here we create a black placeholder image for demonstration
+    # image_path = 'path_to_your_image.jpg'
+    # ego_view_image = cv2.imread(image_path)
 
-    # 5. Perform projection and visualization
-    result_image = project_trajectory_to_image(ego_view_image, trajectory_flu, K_matrix)
+    # if ego_view_image is None:
+    #     print(f"\nWarning: Unable to load image '{image_path}', using a black placeholder image.")
+    #     ego_view_image = np.zeros((CROP_HEIGHT, CROP_WIDTH, 3), dtype=np.uint8)
+    # else:
+    #     # Ensure the image size is correct
+    #     if ego_view_image.shape[0] != CROP_HEIGHT or ego_view_image.shape[1] != CROP_WIDTH:
+    #         print(f"Warning: Your image size is {ego_view_image.shape[:2]}, resizing to ({CROP_HEIGHT}, {CROP_WIDTH}).")
+    #         ego_view_image = cv2.resize(ego_view_image, (CROP_WIDTH, CROP_HEIGHT))
 
-    # 6. Show the result
-    # cv2.imshow('Drone Trajectory Projection (Cropped Image)', result_image)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
+    # # 4. Define a sample trajectory (FLU coordinate system: forward, left, up), unit: meter
+    # # The trajectory first flies forward, then left, then up
+    # # (x: forward, y: left, z: up)
+    # trajectory_flu = [
+    #     [0, 0, 0, 0],      # Start point
+    #     [15, 3, 0.2, 0],  # 15m forward, 3m left, slight climb
+    #     [20, 1, 0, 0],     # 20m forward, 1m left, back to level
+    #     [25, -2, 0.2, 0],  # 25m forward, 2m right (y negative), slight climb
+    #     [30, -3, 0.5, 0],  # 30m forward, 3m right, continue climbing
+    #     [35, -1, 1.0, 0],  # 35m forward, 1m right, climb to 1m
+    #     [40, 0, 1.5, 0],   # 40m forward, back to center, climb to 1.5m
+    # ]
 
-    # Optional: Save the result image
-    cv2.imwrite('trajectory_visualization_cropped.png', result_image)
+    # # 5. Perform projection and visualization
+    # result_image = project_trajectory_to_image(ego_view_image, trajectory_flu, K_matrix)
+
+    # # 6. Show the result
+    # # cv2.imshow('Drone Trajectory Projection (Cropped Image)', result_image)
+    # # cv2.waitKey(0)
+    # # cv2.destroyAllWindows()
+
+    # # Optional: Save the result image
+    # cv2.imwrite('trajectory_visualization_cropped.png', result_image)

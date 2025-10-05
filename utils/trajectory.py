@@ -90,6 +90,8 @@ class TrajectoryProcessor:
             # --- After the loop ---
             # File is done; if there's a last trajectory buffered, yield it
             if self._current_traj_id is not None:
+                # sort the images by frame_idx before yielding
+                self._current_images.sort(key=lambda x: x[0])
                 yield (self._current_traj_id, iter(self._current_images), self._current_log)
 
         except Exception as e:
@@ -143,7 +145,7 @@ class MultiParquetTrajectoryProcessor:
 
 if __name__ == "__main__":
     # Your Parquet file path
-    file_path = 'UAVFlow/train-00053-of-00054.parquet'
+    file_path = '/home/shrelic/T7/UAV-Flow/train-00053-of-00054.parquet'
 
     # Initialize the trajectory processor
     processor = TrajectoryProcessor(file_path, batch_size=200)

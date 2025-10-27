@@ -7,6 +7,15 @@ from PIL import Image
 import io
 import argparse
 
+# Global counters for reporting (will be printed in the __main__ block)
+TRAIN_COUNT = 0
+EVAL_COUNT = 0
+TOTAL_FRAMES_TRAIN = 0
+TOTAL_FRAMES_EVAL = 0
+TOTAL_SECONDS_TRAIN = 0.0
+TOTAL_SECONDS_EVAL = 0.0
+FPS_NOT_MATCH_TIMES = 0
+
 
 # Import the main class from the lerobot library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -55,9 +64,33 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=5, help="Target frames per second for the dataset.")
     parser.add_argument("--data-path", type=str, default="./UAVFlow", help="Path to the source UAVFlow data directory.")
     parser.add_argument("--robot-type", type=str, default="tello", help="Robot type identifier for LeRobot dataset.")
-    parser.add_argument("--train-trajectories", type=int, default=1000, help="Number of trajectories for the training split.")
-    parser.add_argument("--eval-trajectories", type=int, default=200, help="Number of trajectories for the eval split.")
+    parser.add_argument(
+        "--train-trajectories",
+        type=str,
+        default="1000",
+        help="Number of trajectories for the training split. Use 'inf' to process all available trajectories.",
+    )
+    parser.add_argument(
+        "--eval-trajectories",
+        type=str,
+        default="200",
+        help="Number of trajectories for the eval split. Use 'inf' to process all available trajectories.",
+    )
     return parser.parse_args()
+
+
+def parse_trajectories_arg(val: str):
+    """Parse trajectory count CLI arg. Accepts integer strings or 'inf' to mean unlimited."""
+    if val is None:
+        return 0
+    v = str(val).strip().lower()
+    if v in ("inf", "infty", "infinite", "+inf", "all"):
+        return float("inf")
+    try:
+        n = int(float(v))
+        return max(0, n)
+    except Exception:
+        raise ValueError(f"Invalid trajectory count: {val}")
 
 def get_task_idx(ds: LeRobotDataset, task: str, episode_idx: int=None) -> int:
     """Get the index of a task, adding it if it doesn't exist."""
@@ -71,9 +104,9 @@ def get_task_idx(ds: LeRobotDataset, task: str, episode_idx: int=None) -> int:
 import signal
 
 def main():
-    FPS_NOT_MATCH_TIMES = 0
-
     args = parse_args()
+    # use module-level globals for reporting
+    global TRAIN_COUNT, EVAL_COUNT, TOTAL_FRAMES_TRAIN, TOTAL_FRAMES_EVAL, TOTAL_SECONDS_TRAIN, TOTAL_SECONDS_EVAL, FPS_NOT_MATCH_TIMES
     from utils.rotation import relative_pose_given_axes
     from utils.trajectory import MultiParquetTrajectoryProcessor
 
@@ -119,11 +152,16 @@ def main():
 
     POSE_INDICES={"x": 0, "y": 1, "z": 2, "roll": 3, "pitch": 5, "yaw": 4}
 
-    train_target = int(max(0, args.train_trajectories))
-    eval_target = int(max(0, args.eval_trajectories))
+    train_target = parse_trajectories_arg(args.train_trajectories)
+    eval_target = parse_trajectories_arg(args.eval_trajectories)
 
-    train_count = 0
-    eval_count = 0
+    # local aliases (write-through to globals)
+    train_count = TRAIN_COUNT
+    eval_count = EVAL_COUNT
+    total_frames_train = TOTAL_FRAMES_TRAIN
+    total_frames_eval = TOTAL_FRAMES_EVAL
+    total_seconds_train = TOTAL_SECONDS_TRAIN
+    total_seconds_eval = TOTAL_SECONDS_EVAL
 
     # Track which dataset we're currently writing into (for graceful interrupts)
     current_tds = None
@@ -137,21 +175,22 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    done = False
     try:
         for _, traj_images, log in uav_flow_dataset:
             for instruction_key in ["instruction", "instruction_unified"]:
-                # Decide which split to write to next
-                if train_count < train_target:
-                    current_tds = tds_train
-                    split_name = "train"
-                elif eval_count < eval_target:
+                # Decide which split to write to next: save eval first, then train
+                if eval_count < eval_target:
                     current_tds = tds_eval
                     split_name = "eval"
+                elif train_count < train_target:
+                    current_tds = tds_train
+                    split_name = "train"
                 else:
-                    # Both targets satisfied; finish.
-                    print(f"Finished. Processed train={train_count}, eval={eval_count} trajectories.")
-                    print(f"Total times fps mismatch detected: {FPS_NOT_MATCH_TIMES}")
-                    return
+                    # Both targets satisfied; finish processing loop and exit main so reporting happens in __main__
+                    print(f"Reached targets: processed train={train_count}, eval={eval_count}. Stopping further processing.")
+                    done = True
+                    break
 
                 task = log[instruction_key]
 
@@ -207,29 +246,79 @@ def main():
                     added_frames += 1
 
                 if added_frames > 0:
+                    # compute trajectory duration using raw_logs first and last frame timestamps
+                    raw_logs = log['raw_logs']
+                    try:
+                        first_ts = float(raw_logs[0][-1])
+                        last_ts = float(raw_logs[frame_idx][-1])
+                    except Exception:
+                        # fallback if indexing fails; set duration 0
+                        first_ts = 0.0
+                        last_ts = 0.0
+                    duration = max(0.0, last_ts - first_ts)
+
                     episode_idx += 1
                     if split_name == "train":
                         train_count += 1
+                        total_frames_train += added_frames
+                        total_seconds_train += duration
                     else:
                         eval_count += 1
-                    print(f"[{split_name}] saved trajectory with {frame_idx+1} frames, task: {task}")
+                        total_frames_eval += added_frames
+                        total_seconds_eval += duration
+
+                    print(f"[{split_name}] saved trajectory with {added_frames} frames, task: {task}")
                     current_tds.save_episode()
 
                 if interrupted:
                     print("Gracefully saved episode after interruption.")
                     print(f"Processed so far -> train={train_count}, eval={eval_count} trajectories.")
-                    return
+                    # stop processing and return to let __main__ report
+                    done = True
+                    break
 
-        print(f"All done! Total trajectories processed: train={train_count}, eval={eval_count}")
-        print(f"Total times fps mismatch detected: {FPS_NOT_MATCH_TIMES}")
+            if done or interrupted:
+                break
+        # update module-level globals from local counters before exiting main
+        TRAIN_COUNT = train_count
+        EVAL_COUNT = eval_count
+        TOTAL_FRAMES_TRAIN = total_frames_train
+        TOTAL_FRAMES_EVAL = total_frames_eval
+        TOTAL_SECONDS_TRAIN = total_seconds_train
+        TOTAL_SECONDS_EVAL = total_seconds_eval
+        # FPS_NOT_MATCH_TIMES is updated in place
+        return
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt caught in main loop. Saving current episode if needed...")
         if current_tds is not None:
             current_tds.save_episode()
         print("Episode saved. Exiting.")
+        # update globals from locals (if locals exist in scope)
+        try:
+            TRAIN_COUNT = train_count
+            EVAL_COUNT = eval_count
+            TOTAL_FRAMES_TRAIN = total_frames_train
+            TOTAL_FRAMES_EVAL = total_frames_eval
+            TOTAL_SECONDS_TRAIN = total_seconds_train
+            TOTAL_SECONDS_EVAL = total_seconds_eval
+        except Exception:
+            pass
+        return
 
 
 if __name__ == "__main__":
     main()
+
+    # Print final report using module-level globals
+    def _fmt(s):
+        h = int(s // 3600)
+        m = int((s % 3600) // 60)
+        sec = s - h*3600 - m*60
+        return f"{h}h {m}m {sec:.2f}s"
+
+    print("--- Final report ---")
+    print(f"Total times fps mismatch detected: {FPS_NOT_MATCH_TIMES}")
+    print(f"Eval -> trajectories: {EVAL_COUNT}, frames: {TOTAL_FRAMES_EVAL}, total duration: {_fmt(TOTAL_SECONDS_EVAL)}")
+    print(f"Train -> trajectories: {TRAIN_COUNT}, frames: {TOTAL_FRAMES_TRAIN}, total duration: {_fmt(TOTAL_SECONDS_TRAIN)}")
 
     

@@ -1512,6 +1512,19 @@ wheels = [
 ]
 
 [[package]]
+name = "json-numpy"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/41/c37467c113c72742501c45974f70efbec94243cd357b93e18a1dc205a54a/json_numpy-2.1.1.tar.gz", hash = "sha256:3e6260fc29626e7a6a60d52a1f9ad8f522a9051f57ac55d5dfdeeaba55d4a835", size = 9032, upload-time = "2025-06-30T03:11:48.042Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cc/61/7bec579093bc5f8da7f308a319e0d9372409f4bc0f7ea95588051b8cf139/json_numpy-2.1.1-py3-none-any.whl", hash = "sha256:91e45b756c1345f478651c3d7e767a7488335f34a3d500ef7829b917a8043c28", size = 5493, upload-time = "2025-06-30T03:10:56.823Z" },
+]
+
+[[package]]
 name = "json5"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -4462,6 +4475,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "ffmpeg" },
+    { name = "json-numpy" },
     { name = "lerobot" },
     { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -4486,6 +4500,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ffmpeg", specifier = ">=1.4" },
+    { name = "json-numpy", specifier = ">=2.1.1" },
     { name = "lerobot", specifier = ">=0.3.3" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "numpy", specifier = ">=2.2.6" },

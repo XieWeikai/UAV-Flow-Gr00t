@@ -1,0 +1,1 @@
+PYTHONWARNINGS="ignore::UserWarning" python scripts/inference_service.py --host 0.0.0.0 --server --http-server --data_config examples.UAV_Flow.custom_data_config:UAVFlowDataConfig --embodiment_tag new_embodiment --denoising_steps 16 --model_path path/to/model

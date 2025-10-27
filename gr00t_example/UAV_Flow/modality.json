@@ -1,0 +1,23 @@
+{
+    "state": {
+        "drone": {
+            "start": 0,
+            "end": 4
+        }
+    },
+    "action": {
+        "delta_pose": {
+            "start": 0,
+            "end": 4,
+            "absolute": false
+        }
+    },
+    "video": {
+        "ego_view": {
+            "original_key": "video.ego_view"
+        }
+    },
+    "annotation": {
+        "human.action.task_description": {}
+    }
+}

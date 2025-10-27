@@ -1,0 +1,3 @@
+export WANDB_PROJECT=UAV
+# export WANDB_NAME=experiment_001
+PYTHONWARNINGS="ignore::UserWarning" python scripts/gr00t_finetune.py --dataset-path path/to/UAV-Flow-Gr00t/UAVFlowSimLeRobot-train --dataset-path path/to/UAVFlowLeRobot-train --data_config examples.UAV_Flow.custom_data_config:UAVFlowFirstLastFrameStateDataConfig --num-gpus 1 --batch-size 16 --save_steps 25000 --output-dir ./UAV-Gr00t --max-steps 300000 --tune_visual --tune_llm --learning_rate '1e-5' --video-backend torchvision_av --report_to wandb --base_model_path path/to/GR00T-N1.5-3B

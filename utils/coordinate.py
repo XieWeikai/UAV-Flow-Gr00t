@@ -81,6 +81,51 @@ def relative_pose_given_axes(p1: np.array, p2: np.array, degree=False, axes: lis
     return relative_pose(p1, p2, degree=degree)
 
 
+def to_homogeneous(points: np.array, is_point=True) -> np.array:
+    """
+    Converts Nx3 points to Nx4 homogeneous coordinates.
+    Args:
+        points (np.array): Nx3 or 3 array of points.
+        is_point (bool): If True, appends 1 for points; if False, appends 0 for vectors.
+    Returns:
+        np.array: Nx4 or 4 array of homogeneous coordinates.
+    """
+    ndim = points.ndim
+    if points.ndim == 1:
+        assert points.shape[0] == 3
+        points = points.reshape(1, 3)
+
+    N = points.shape[0]
+    if is_point:
+        ones = np.ones((N, 1))
+        points = np.hstack((points, ones))
+    else:
+        zeros = np.zeros((N, 1))
+        points = np.hstack((points, zeros))
+
+    if ndim == 1:
+        points = points.flatten()
+    return points
+    
+
+def homogeneous_inv(T: np.array) -> np.array:
+    """
+    Inverts a homogeneous transformation matrix.
+    Args:
+        T (np.array): 4x4 homogeneous transformation matrix.
+    Returns:
+        np.array: 4x4 inverted transformation matrix.
+    """
+    R = T[0:3, 0:3]
+    t = T[0:3, 3]
+    R_inv = R.T
+    t_inv = -R_inv @ t
+    T_inv = np.eye(4)
+    T_inv[0:3, 0:3] = R_inv
+    T_inv[0:3, 3] = t_inv
+    return T_inv
+
+
 def dict_to_array(p: dict) -> np.array:
     return np.array([p[key] * sign[key] for key in indices.keys()])
 

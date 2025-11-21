@@ -158,8 +158,8 @@ if __name__ == '__main__':
     PATH = pathlib.Path(__file__).parent
     sys.path.append(str(PATH.parent))
     
-    from utils.trajectory import TrajectoryProcessor
-    from utils.rotation import relative_pose_given_axes
+    from utils.uavflow.trajectory import TrajectoryProcessor
+    from utils.coordinate import relative_pose_given_axes
     file_path = '/home/shrelic/T7/UAV-Flow/train-00053-of-00054.parquet'
     processor = TrajectoryProcessor(file_path)
 

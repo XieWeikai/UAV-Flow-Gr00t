@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 from PIL import Image
 import io
+from utils import get_task_idx
 import argparse
 
 # Global counters for reporting (will be printed in the __main__ block)
@@ -92,13 +93,7 @@ def parse_trajectories_arg(val: str):
     except Exception:
         raise ValueError(f"Invalid trajectory count: {val}")
 
-def get_task_idx(ds: LeRobotDataset, task: str, episode_idx: int=None) -> int:
-    """Get the index of a task, adding it if it doesn't exist."""
-    task_index = ds.meta.get_task_index(task)
-    if task_index is None:
-        ds.meta.add_task(task)
-        task_index = ds.meta.get_task_index(task)
-    return task_index
+
 
 
 import signal
@@ -107,8 +102,8 @@ def main():
     args = parse_args()
     # use module-level globals for reporting
     global TRAIN_COUNT, EVAL_COUNT, TOTAL_FRAMES_TRAIN, TOTAL_FRAMES_EVAL, TOTAL_SECONDS_TRAIN, TOTAL_SECONDS_EVAL, FPS_NOT_MATCH_TIMES
-    from utils.rotation import relative_pose_given_axes
-    from utils.trajectory import MultiParquetTrajectoryProcessor
+    from utils.coordinate import relative_pose_given_axes
+    from utils.uavflow.trajectory import MultiParquetTrajectoryProcessor
 
     repo_id = args.repo_id
     # Create two datasets: one for train and one for eval

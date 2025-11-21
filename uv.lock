@@ -4472,7 +4472,7 @@ wheels = [
 [[package]]
 name = "uavflow2lerobot"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "ffmpeg" },
     { name = "json-numpy" },

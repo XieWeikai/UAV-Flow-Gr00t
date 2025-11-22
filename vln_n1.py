@@ -8,7 +8,7 @@ import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from utils import get_task_idx, Traj
-from utils.vln_n1 import VLN_N1_Traj, VLN_N1_Trajectories
+from utils.vln_n1 import VLN_N1_Trajectories
 from functools import partial
 from argparse import ArgumentParser
 
@@ -77,14 +77,15 @@ def validate_dataset(repo_id, root: str):
 
 def main():
     raw_dir = args.raw_dir
+    folder_name = Path(raw_dir).name
     port(
         raw_dir=raw_dir,
-        repo_id="VLN-N1",
-        root="./VLN-N1",
+        repo_id=f"VLN-N1-{folder_name}",
+        root=f"./VLN-N1-{folder_name}",
         traj_cls=VLN_N1_Trajectories,
     )
     
-    validate_dataset("VLN-N1", root="./VLN-N1")
+    validate_dataset(f"VLN-N1-{folder_name}", root=f"./VLN-N1-{folder_name}")
 
 
 if __name__ == "__main__":

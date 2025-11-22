@@ -235,18 +235,57 @@ class VLN_N1_Trajectories(Trajectories):
     INSTRUCTION_KEY = "annotation.human.action.task_description"
     
     def __init__(self, data_path: str, get_task_idx: Callable[[str], int]):
-        self.data_path = data_path
+        self.data_path = Path(data_path)
         self.processor = InternDataProcessor(data_path)
-        self.trajectory_dirs = self.processor.get_trajectory_dirs()
+        all_dirs = self.processor.get_trajectory_dirs()
         self.get_task_idx = get_task_idx
+        
+        self.progress_file = self.data_path / "processed_trajectories.txt"
+        
+        self.processed_dirs = set()
+        if self.progress_file.exists():
+            with open(self.progress_file, "r") as f:
+                self.processed_dirs = set(line.strip() for line in f)
+        
+        # Filter out processed directories
+        self.trajectory_dirs = []
+        for d in all_dirs:
+            try:
+                rel_path = d.relative_to(self.data_path)
+                if str(rel_path) not in self.processed_dirs:
+                    self.trajectory_dirs.append(d)
+            except ValueError:
+                logging.warning(f"Path {d} is not relative to {self.data_path}. Processing it anyway.")
+                self.trajectory_dirs.append(d)
     
     def __len__(self):
         return len(self.trajectory_dirs)
     
     def __iter__(self):
+        previous_traj_rel = None
+        
         for traj_dir in self.trajectory_dirs:
+            try:
+                current_traj_rel = str(traj_dir.relative_to(self.data_path))
+            except ValueError:
+                current_traj_rel = str(traj_dir)
+
+            # If we are starting a new trajectory, mark the previous one as completed
+            if previous_traj_rel is not None:
+                with open(self.progress_file, "a") as f:
+                    f.write(f"{previous_traj_rel}\n")
+                self.processed_dirs.add(previous_traj_rel)
+            
             frames = self.processor.get_trajectory_data(traj_dir)
             yield VLN_N1_Traj(frames, self.get_task_idx)
+            
+            previous_traj_rel = current_traj_rel
+            
+        # Mark the last trajectory as completed if we finished the loop
+        if previous_traj_rel is not None:
+            with open(self.progress_file, "a") as f:
+                f.write(f"{previous_traj_rel}\n")
+            self.processed_dirs.add(previous_traj_rel)
         
 
 if __name__ == "__main__":
@@ -263,6 +302,6 @@ if __name__ == "__main__":
     
     for traj in trajectories:
         logging.info(f"Trajectory with {len(traj)} frames.")
-        for frame in traj:
-            pass
+        for frame, task in traj:
+            print(f"Frame keys: {list(frame.keys())}")
         

@@ -14,6 +14,7 @@ from argparse import ArgumentParser
 
 parser = ArgumentParser(description="Port VLN-N1 dataset to LeRobotDataset format")
 parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo", help="Path to the raw VLN-N1 dataset directory")
+parser.add_argument("--output_dir", type=str, default=".", help="Path to the output LeRobotDataset directory")
 args = parser.parse_args()
     
 
@@ -76,17 +77,19 @@ def validate_dataset(repo_id, root: str):
 
 
 def main():
-    raw_dir = args.raw_dir
-    folder_name = Path(raw_dir).name
+    raw_dir = Path(args.raw_dir)
+    folder_name = raw_dir.name
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root = output_dir / f"VLN-N1-{folder_name}"
     port(
         raw_dir=raw_dir,
         repo_id=f"VLN-N1-{folder_name}",
-        root=f"./VLN-N1-{folder_name}",
+        root=root,
         traj_cls=VLN_N1_Trajectories,
     )
     
-    validate_dataset(f"VLN-N1-{folder_name}", root=f"./VLN-N1-{folder_name}")
-
+    validate_dataset(f"VLN-N1-{folder_name}", root=root)
 
 if __name__ == "__main__":
     main()

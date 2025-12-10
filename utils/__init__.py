@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 def get_task_idx(ds: LeRobotDataset, task: str) -> int:
@@ -21,7 +22,7 @@ class Traj:
     def __iter__(self):
         raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
 
-class Trajectories:
+class Trajectories(ABC):
     """
     abstract class representing a collection of trajectories.
     """
@@ -37,4 +38,10 @@ class Trajectories:
         raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")
 
     def __iter__(self):
+        raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")
+    
+    @property
+    @abstractmethod
+    def schema(self) -> dict:
+        """Return the schema for the dataset."""
         raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")

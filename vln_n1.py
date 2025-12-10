@@ -2,10 +2,9 @@ import logging
 import time
 from pathlib import Path
 
-import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from utils import get_task_idx, Traj
+from utils import Trajectories, get_task_idx
 from utils.vln_n1 import VLN_N1_Trajectories
 from functools import partial
 from argparse import ArgumentParser
@@ -30,11 +29,14 @@ def port(
     raw_dir: str,
     repo_id: str,
     root: str,
-    traj_cls: Traj,
+    traj_cls: type[Trajectories],
     *args, **kwargs
 ):
     """Port raw dataset to LeRobotDataset format."""
     logging.info(f"Porting raw dataset from {raw_dir} to LeRobotDataset repo {repo_id}")
+    
+    # Determine features dynamically
+    features = traj_cls.get_features(raw_dir)
 
     if root and Path(root).exists():
         logging.info(f"Loading existing dataset from {root}")
@@ -46,8 +48,9 @@ def port(
             root=root,
             robot_type=traj_cls.ROBOT_TYPE,
             fps=traj_cls.FPS,
-            features=traj_cls.FEATURES,
+            features=features,
         )
+    
     trajectories = traj_cls(raw_dir, get_task_idx=partial(get_task_idx, lerobot_dataset))
 
     start_time = time.time()

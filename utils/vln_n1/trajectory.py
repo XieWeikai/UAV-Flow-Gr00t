@@ -74,13 +74,16 @@ class InternDataProcessor:
 from utils import Trajectories, Traj
 
 class VLN_N1_Traj(Traj):
-    IMAGE_SIZE = (256, 256)
     
-    def __init__(self, frames: dict, get_task_idx: Callable[[str], int]):
+    def __init__(self, frames: dict, get_task_idx: Callable[[str], int], image_size: tuple[int, int] = (256, 256)):
         self.frames = frames
+        self.image_size = image_size
         self.df = pd.read_parquet(frames["parquet_path"])
         self.actions = self.df['action']
         episodes_path = frames["trajectory_dir"] / "meta/episodes.jsonl"
+        if not episodes_path.exists():
+            raise FileNotFoundError(f"Episodes metadata file not found: {episodes_path}")
+            
         with open(episodes_path, 'r', encoding='utf-8') as f:
             task = json.load(f)
         task = task["tasks"]
@@ -144,7 +147,7 @@ class VLN_N1_Traj(Traj):
         for idx in range(len(self.images)):
             # ego_view
             img = Image.open(self.images[idx])
-            img = img.resize(self.IMAGE_SIZE)
+            img = img.resize(self.image_size)
             img = np.array(img)
             
             # compute pose in c_base frame
@@ -234,9 +237,58 @@ class VLN_N1_Trajectories(Trajectories):
     
     INSTRUCTION_KEY = "annotation.human.action.task_description"
     
+    @classmethod
+    def get_features(cls, data_path: str) -> dict:
+        """
+        Dynamically determine features based on the dataset content.
+        Specifically, it reads one image to determine the video resolution.
+        """
+        features = cls.FEATURES.copy()
+        
+        # Try to find an image to determine size
+        processor = InternDataProcessor(data_path)
+        traj_dirs = processor.get_trajectory_dirs()
+        
+        if not traj_dirs:
+            logging.warning(f"No trajectories found in {data_path}. Using default resolution (256, 256).")
+            return features
+
+        # Try to find a valid image in the first few trajectories
+        found_image = False
+        for traj_dir in traj_dirs[:5]: # Check first 5 trajectories
+            data = processor.get_trajectory_data(traj_dir)
+            if data["images"]:
+                try:
+                    with Image.open(data["images"][0]) as img:
+                        width, height = img.size
+                        features["video.ego_view"]["shape"] = (height, width, 3)
+                        features["video.ego_view"]["names"] = ["height", "width", "channels"]
+                        logging.info(f"Determined video resolution from data: {width}x{height}")
+                        found_image = True
+                        break
+                except Exception as e:
+                    logging.warning(f"Failed to read image size from {data['images'][0]}: {e}")
+        
+        if not found_image:
+            logging.warning("Could not determine image size from data. Using default resolution (256, 256).")
+            
+        return features
+
     def __init__(self, data_path: str, get_task_idx: Callable[[str], int]):
         self.data_path = Path(data_path)
         self.processor = InternDataProcessor(data_path)
+        
+        # Determine image size from features (which should have been set up via get_features or default)
+        # Since we can't easily access the class-level modified features if get_features was called externally
+        # and returned a new dict, we re-run the logic or expect it to be passed.
+        # However, to keep it simple and consistent with how vln_n1.py uses it, 
+        # we will re-detect or use the one from get_features if we could store it.
+        # But here, let's just re-detect it to be safe and self-contained, 
+        # or better yet, let's use the same logic as get_features to set an instance variable.
+        
+        features = self.get_features(data_path)
+        self.image_size = (features["video.ego_view"]["shape"][1], features["video.ego_view"]["shape"][0]) # (width, height)
+        
         all_dirs = self.processor.get_trajectory_dirs()
         self.get_task_idx = get_task_idx
         
@@ -280,7 +332,13 @@ class VLN_N1_Trajectories(Trajectories):
                 self.processed_dirs.add(previous_traj_rel)
             
             frames = self.processor.get_trajectory_data(traj_dir)
-            yield VLN_N1_Traj(frames, self.get_task_idx)
+            try:
+                traj = VLN_N1_Traj(frames, self.get_task_idx, image_size=self.image_size)
+            except Exception as e:
+                logging.warning(f"Skipping trajectory {traj_dir} due to error: {e}")
+                continue
+            
+            yield traj
             
             previous_traj_rel = current_traj_rel
             
@@ -289,6 +347,10 @@ class VLN_N1_Trajectories(Trajectories):
             with open(self.progress_file, "a") as f:
                 f.write(f"{previous_traj_rel}\n")
             self.processed_dirs.add(previous_traj_rel)
+
+    @property
+    def schema(self) -> dict:
+        return self.FEATURES
         
 
 if __name__ == "__main__":

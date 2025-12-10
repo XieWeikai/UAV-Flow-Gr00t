@@ -246,6 +246,8 @@ class VLN_N1_Trajectories(Trajectories):
         if self.progress_file.exists():
             with open(self.progress_file, "r") as f:
                 self.processed_dirs = set(line.strip() for line in f)
+            logging.info(f"Loaded {len(self.processed_dirs)} processed trajectories from {self.progress_file}")
+            logging.info(f"total trajectories found: {len(all_dirs)}")
         
         # Filter out processed directories
         self.trajectory_dirs = []
@@ -257,6 +259,7 @@ class VLN_N1_Trajectories(Trajectories):
             except ValueError:
                 logging.warning(f"Path {d} is not relative to {self.data_path}. Processing it anyway.")
                 self.trajectory_dirs.append(d)
+        logging.info(f"{len(self.trajectory_dirs)} trajectories to process after filtering.")
     
     def __len__(self):
         return len(self.trajectory_dirs)

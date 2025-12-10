@@ -20,6 +20,7 @@ FPS_NOT_MATCH_TIMES = 0
 
 # Import the main class from the lerobot library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from utils.video import use_encoding
 
 # Define the features (schema) for our drone dataset.
 # This structure tells the dataset writer what kind of data to expect.
@@ -77,6 +78,7 @@ def parse_args():
         default="200",
         help="Number of trajectories for the eval split. Use 'inf' to process all available trajectories.",
     )
+    parser.add_argument("--codec", type=str, default="h264", choices=["h264", "hevc", "libsvtav1"], help="Video codec to use for encoding")
     return parser.parse_args()
 
 
@@ -100,6 +102,7 @@ import signal
 
 def main():
     args = parse_args()
+    use_encoding(args.codec)
     # use module-level globals for reporting
     global TRAIN_COUNT, EVAL_COUNT, TOTAL_FRAMES_TRAIN, TOTAL_FRAMES_EVAL, TOTAL_SECONDS_TRAIN, TOTAL_SECONDS_EVAL, FPS_NOT_MATCH_TIMES
     from utils.coordinate import relative_pose_given_axes

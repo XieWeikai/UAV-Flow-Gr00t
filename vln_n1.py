@@ -1,7 +1,5 @@
 import logging
 import time
-import shutil
-import argparse
 from pathlib import Path
 
 import numpy as np
@@ -12,10 +10,20 @@ from utils.vln_n1 import VLN_N1_Trajectories
 from functools import partial
 from argparse import ArgumentParser
 
+from utils.video import use_encoding
+
+logging.basicConfig(
+    level=logging.INFO,      # 把门槛降到 INFO
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+
 parser = ArgumentParser(description="Port VLN-N1 dataset to LeRobotDataset format")
 parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo", help="Path to the raw VLN-N1 dataset directory")
 parser.add_argument("--output_dir", type=str, default=".", help="Path to the output LeRobotDataset directory")
+parser.add_argument("--codec", type=str, default="h264", choices=["h264", "hevc", "libsvtav1"], help="Video codec to use for encoding")
 args = parser.parse_args()
+
+use_encoding(args.codec)
     
 
 def port(
@@ -32,6 +40,7 @@ def port(
         logging.info(f"Loading existing dataset from {root}")
         lerobot_dataset = LeRobotDataset(repo_id, root=root)
     else:
+        logging.info(f"Creating new dataset at {root}")
         lerobot_dataset = LeRobotDataset.create(
             repo_id=repo_id,
             root=root,

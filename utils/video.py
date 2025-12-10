@@ -4,6 +4,8 @@ from PIL import Image
 import io
 import numpy as np
 import cv2
+import lerobot.datasets.lerobot_dataset
+from lerobot.datasets import video_utils
 
 class VideoBuilder:
     def __init__(self, fps: int, width: int, height: int) -> None:
@@ -151,6 +153,21 @@ def get_intrinsics(
     return K
 
 
+def use_encoding(encoding_name: str = "h264"):
+    """
+    Apply the monkey patch to force a specific video codec in LeRobotDataset.
+    Options: "h264", "hevc", "libsvtav1"
+    """
+    valid_codecs = ["h264", "hevc", "libsvtav1"]
+    assert encoding_name in valid_codecs, f"Invalid codec: {encoding_name}. Must be one of {valid_codecs}"
+
+    def patched_encode_video_frames(*args, **kwargs):
+        kwargs["vcodec"] = encoding_name
+        return video_utils.encode_video_frames(*args, **kwargs)
+
+    lerobot.datasets.lerobot_dataset.encode_video_frames = patched_encode_video_frames
+
+
 # --- Main program ---
 if __name__ == '__main__':
     import os, sys, pathlib
@@ -251,4 +268,5 @@ if __name__ == '__main__':
     # # cv2.destroyAllWindows()
 
     # # Optional: Save the result image
+
     # cv2.imwrite('trajectory_visualization_cropped.png', result_image)

@@ -174,8 +174,12 @@ class VLN_N1_Traj(Traj):
             x, y, z = p_c_base
             
             # in camera base frame, +x is right, +y is up, +z is backwards
-            # and we want to use a frame where +x is right, +y is forwards, +z is up
-            pose = np.array([x, -z, y, yaw_rel], dtype=np.float32) # this is in our desired frame where +x is right, +y is forwards, +z is up
+            # # and we want to use a frame where +x is right, +y is forwards, +z is up
+            # pose = np.array([x, -z, y, yaw_rel], dtype=np.float32) # this is in our desired frame where +x is right, +y is forwards, +z is up
+
+            # NOTE: above is deprecated,
+            # now we want to use a frame where +x is front, +y is left, +z is up
+            pose = np.array([-z, -x, y, yaw_rel], dtype=np.float32) # this is in our desired frame where +x is front, +y is left, +z is up
             
             # action is relative pose to last pose
             action = self.to_4d(

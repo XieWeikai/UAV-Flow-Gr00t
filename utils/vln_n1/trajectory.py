@@ -19,56 +19,143 @@ class InternDataProcessor:
         if not self.root_path.exists():
             logging.warning(f"Root path {self.root_path} does not exist.")
 
+    # def get_trajectory_dirs(self) -> List[Path]:
+    #     """
+    #     Get a list of all trajectory directories (e.g., trajectory_5).
+    #     """
+    #     # Recursively find all directories starting with 'trajectory_'
+    #     traj_dirs = list(self.root_path.rglob("trajectory_*"))
+    #     # Filter to ensure they are directories
+    #     traj_dirs = [d for d in traj_dirs if d.is_dir()]
+    #     # Sort them for consistent order (optional but nice)
+    #     traj_dirs.sort(key=lambda p: int(p.name.split('_')[-1]) if p.name.split('_')[-1].isdigit() else p.name)
+    #     return traj_dirs
+
+    # NOTE: It is not always 'trajectory_*', so we generalize the search
     def get_trajectory_dirs(self) -> List[Path]:
         """
-        Get a list of all trajectory directories (e.g., trajectory_5).
+        Collect all directories that directly contain
+        'data', 'meta', and 'videos' subdirectories.
         """
-        # Recursively find all directories starting with 'trajectory_'
-        traj_dirs = list(self.root_path.rglob("trajectory_*"))
-        # Filter to ensure they are directories
-        traj_dirs = [d for d in traj_dirs if d.is_dir()]
-        # Sort them for consistent order (optional but nice)
-        traj_dirs.sort(key=lambda p: int(p.name.split('_')[-1]) if p.name.split('_')[-1].isdigit() else p.name)
+        traj_dirs = []
+
+        for d in self.root_path.rglob("*"):
+            if not d.is_dir():
+                continue
+
+            subdirs = {p.name for p in d.iterdir() if p.is_dir()}
+            if {"data", "meta", "videos"}.issubset(subdirs):
+                traj_dirs.append(d)
+
+        traj_dirs.sort(key=lambda p: str(p))
+
         return traj_dirs
 
-    def get_trajectory_data(self, trajectory_dir: Union[str, Path]) -> Dict:
+    def get_episode_indices(self, trajectory_dir: Union[str, Path]) -> List[int]:
         """
-        Given a trajectory directory, return the paths to the parquet file,
-        the images directory, and a list of image files.
+        Quickly get list of episode indices from episodes.jsonl without full processing.
         """
         trajectory_dir = Path(trajectory_dir)
+        episodes_path = trajectory_dir / "meta/episodes.jsonl"
         
-        # 1. Find parquet file
-        # Expected path: data/chunk-000/episode_000000.parquet
-        # We search recursively for any .parquet file to be robust
-        parquet_files = list(trajectory_dir.rglob("*.parquet"))
-        parquet_path = parquet_files[0] if parquet_files else None
+        indices = []
+        if not episodes_path.exists():
+            return indices
 
-        # 2. Find images directory
-        # Expected path: videos/chunk-000/observation.images.rgb/
-        # We search for 'observation.images.rgb' directory
-        images_dirs = list(trajectory_dir.rglob("observation.images.rgb"))
-        images_dir = images_dirs[0] if images_dirs else None
+        with open(episodes_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    ep_info = json.loads(line)
+                    if 'episode_index' in ep_info:
+                        indices.append(ep_info['episode_index'])
+                except json.JSONDecodeError:
+                    continue
+        return indices
 
-        # 3. Get all images
-        images = []
-        if images_dir and images_dir.exists():
-            # Get all .jpg files
-            jpg_files = list(images_dir.glob("*.jpg"))
-            # Sort by numeric filename (e.g., 0.jpg, 1.jpg, 10.jpg)
-            # Assuming filenames are integers
-            try:
-                images = sorted(jpg_files, key=lambda x: int(x.stem))
-            except ValueError:
-                # Fallback to string sort if filenames are not purely numeric
-                images = sorted(jpg_files)
+    def get_episodes_data(self, trajectory_dir: Union[str, Path]) -> List[Dict]:
+        """
+        Given a trajectory directory, return a list of dictionaries,
+        each containing data for one episode found in episodes.jsonl.
+        """
+        trajectory_dir = Path(trajectory_dir)
+        episodes_path = trajectory_dir / "meta/episodes.jsonl"
+        
+        episodes_data = []
+        if not episodes_path.exists():
+            logging.warning(f"Episodes metadata file not found: {episodes_path}")
+            return episodes_data
 
-        return {
-            "trajectory_dir": trajectory_dir,
-            "parquet_path": parquet_path,
-            "images_dir": images_dir,
-            "images": images
-        }
+        valid_ep_infos = []
+        with open(episodes_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    ep_info = json.loads(line)
+                    if ep_info.get('episode_index') is not None:
+                        valid_ep_infos.append(ep_info)
+                except json.JSONDecodeError:
+                    logging.warning(f"Failed to decode JSON line in {episodes_path}: {line}")
+                    continue
+        
+        is_single_episode = (len(valid_ep_infos) == 1)
+
+        for ep_info in valid_ep_infos:
+            episode_index = ep_info.get('episode_index')
+
+            # 1. Find parquet file
+            # Expected path: data/chunk-000/episode_{index:06d}.parquet
+            parquet_name = f"episode_{episode_index:06d}.parquet"
+            parquet_files = list(trajectory_dir.rglob(parquet_name))
+            parquet_path = parquet_files[0] if parquet_files else None
+            
+            if not parquet_path:
+                logging.warning(f"Parquet file {parquet_name} not found in {trajectory_dir}")
+                continue
+
+            # 2. Find images directory
+            images_dirs = list(trajectory_dir.rglob("observation.images.rgb"))
+            images_dir = images_dirs[0] if images_dirs else None
+
+            # 3. Get all images for this episode
+            images = []
+            if images_dir and images_dir.exists():
+                prefix = f"episode_{episode_index:06d}_"
+                jpg_files = list(images_dir.glob(f"{prefix}*.jpg"))
+                
+                if jpg_files:
+                    try:
+                        # Sort by the frame index at the end
+                        images = sorted(jpg_files, key=lambda x: int(x.stem.split('_')[-1]))
+                    except ValueError:
+                        images = sorted(jpg_files)
+                elif is_single_episode:
+                    # Fallback only if single episode
+                    jpg_files = list(images_dir.glob("*.jpg"))
+                    try:
+                        images = sorted(jpg_files, key=lambda x: int(x.stem))
+                    except ValueError:
+                        images = sorted(jpg_files)
+                    
+                    if not images:
+                         raise FileNotFoundError(f"No images found for single episode {episode_index} in {images_dir}")
+                else:
+                    raise FileNotFoundError(f"No images found with prefix {prefix} for episode {episode_index} in {images_dir} (multiple episodes present)")
+            else:
+                 logging.warning(f"Images directory not found in {trajectory_dir}")
+                 continue
+
+            episodes_data.append({
+                "trajectory_dir": trajectory_dir,
+                "parquet_path": parquet_path,
+                "images_dir": images_dir,
+                "images": images,
+                "episode_info": ep_info
+            })
+
+        return episodes_data
         
 
 from utils import Trajectories, Traj
@@ -80,16 +167,28 @@ class VLN_N1_Traj(Traj):
         self.image_size = image_size
         self.df = pd.read_parquet(frames["parquet_path"])
         self.actions = self.df['action']
-        episodes_path = frames["trajectory_dir"] / "meta/episodes.jsonl"
-        if not episodes_path.exists():
-            raise FileNotFoundError(f"Episodes metadata file not found: {episodes_path}")
-            
-        with open(episodes_path, 'r', encoding='utf-8') as f:
-            task = json.load(f)
-        task = task["tasks"]
-        tasks = [json.loads(j) for j in task]
-        tasks_str = json.dumps(tasks)
-        self.task = tasks_str
+        
+        if "episode_info" in frames:
+            task_data = frames["episode_info"]
+            tasks = task_data["tasks"]
+            # If tasks are strings (old format?), parse them. Otherwise assume dicts.
+            if tasks and isinstance(tasks[0], str):
+                tasks = [json.loads(j) for j in tasks]
+            tasks_str = json.dumps(tasks)
+            self.task = tasks_str
+        else:
+            # Fallback or error if episode_info is missing
+            episodes_path = frames["trajectory_dir"] / "meta/episodes.jsonl"
+            if not episodes_path.exists():
+                raise FileNotFoundError(f"Episodes metadata file not found: {episodes_path}")
+                
+            with open(episodes_path, 'r', encoding='utf-8') as f:
+                task = json.load(f)
+            task = task["tasks"]
+            tasks = [json.loads(j) for j in task]
+            tasks_str = json.dumps(tasks)
+            self.task = tasks_str
+
         self.images = frames["images"]
         self.task_idx = get_task_idx(self.task)
         
@@ -134,8 +233,18 @@ class VLN_N1_Traj(Traj):
         return np.array([x, y, z, yaw], dtype=np.float32)
         
     
+    def _get_action(self, idx: int) -> np.ndarray:
+        action = self.actions[idx]
+        # print(f"action: {action} type: {type(action)}")
+        if action.shape == (16,): # flattened 4x4 matrix
+            action = action.reshape((4,4))
+        # print(f"reshape action: {action} type: {type(action)}")
+        processed_action = np.vstack(action)
+        # print(f"processed_action: {processed_action} type: {type(processed_action)}")
+        return processed_action
+
     def __iter__(self):
-        T_w_c_base = np.vstack(self.actions[0]) # 4x4 homogeneous transformation matrix from c_base (first frame of trajectory) to world
+        T_w_c_base = self._get_action(0) # 4x4 homogeneous transformation matrix from c_base (first frame of trajectory) to world
         
         T_w_c_base = self.roll_to_horizontal(T_w_c_base) # fix the camera orientation
         
@@ -151,7 +260,7 @@ class VLN_N1_Traj(Traj):
             img = np.array(img)
             
             # compute pose in c_base frame
-            T_w_c = np.vstack(self.actions[idx])  # transformation from c (current frame) to world
+            T_w_c = self._get_action(idx)  # transformation from c (current frame) to world
             T_w_c = self.roll_to_horizontal(T_w_c)  # fix the camera orientation
             T_c_base_c = T_c_base_w @ T_w_c  # transformation from c (current frame) to c_base
             R_rel = Rotation.from_matrix(T_c_base_c[:3, :3])
@@ -260,10 +369,10 @@ class VLN_N1_Trajectories(Trajectories):
         # Try to find a valid image in the first few trajectories
         found_image = False
         for traj_dir in traj_dirs[:5]: # Check first 5 trajectories
-            data = processor.get_trajectory_data(traj_dir)
-            if data["images"]:
+            episodes = processor.get_episodes_data(traj_dir)
+            if episodes and episodes[0]["images"]:
                 try:
-                    with Image.open(data["images"][0]) as img:
+                    with Image.open(episodes[0]["images"][0]) as img:
                         width, height = img.size
                         features["video.ego_view"]["shape"] = (height, width, 3)
                         features["video.ego_view"]["names"] = ["height", "width", "channels"]
@@ -271,26 +380,21 @@ class VLN_N1_Trajectories(Trajectories):
                         found_image = True
                         break
                 except Exception as e:
-                    logging.warning(f"Failed to read image size from {data['images'][0]}: {e}")
+                    logging.warning(f"Failed to read image size from {episodes[0]['images'][0]}: {e}")
         
         if not found_image:
             logging.warning("Could not determine image size from data. Using default resolution (256, 256).")
             
         return features
 
-    def __init__(self, data_path: str, get_task_idx: Callable[[str], int]):
+    def __init__(self, data_path: str, get_task_idx: Callable[[str], int], features: dict = None):
         self.data_path = Path(data_path)
         self.processor = InternDataProcessor(data_path)
         
-        # Determine image size from features (which should have been set up via get_features or default)
-        # Since we can't easily access the class-level modified features if get_features was called externally
-        # and returned a new dict, we re-run the logic or expect it to be passed.
-        # However, to keep it simple and consistent with how vln_n1.py uses it, 
-        # we will re-detect or use the one from get_features if we could store it.
-        # But here, let's just re-detect it to be safe and self-contained, 
-        # or better yet, let's use the same logic as get_features to set an instance variable.
+        # Use provided features or detect them
+        if features is None:
+            features = self.get_features(data_path)
         
-        features = self.get_features(data_path)
         self.image_size = (features["video.ego_view"]["shape"][1], features["video.ego_view"]["shape"][0]) # (width, height)
         
         all_dirs = self.processor.get_trajectory_dirs()
@@ -298,59 +402,74 @@ class VLN_N1_Trajectories(Trajectories):
         
         self.progress_file = self.data_path / "processed_trajectories.txt"
         
-        self.processed_dirs = set()
+        self.processed_ids = set()
         if self.progress_file.exists():
             with open(self.progress_file, "r") as f:
-                self.processed_dirs = set(line.strip() for line in f)
-            logging.info(f"Loaded {len(self.processed_dirs)} processed trajectories from {self.progress_file}")
-            logging.info(f"total trajectories found: {len(all_dirs)}")
+                self.processed_ids = set(line.strip() for line in f)
+            logging.info(f"Loaded {len(self.processed_ids)} processed episodes from {self.progress_file}")
         
-        # Filter out processed directories
-        self.trajectory_dirs = []
-        for d in all_dirs:
+        # We keep all directories because we need to check individual episodes inside them
+        self.trajectory_dirs = all_dirs
+        logging.info(f"Found {len(self.trajectory_dirs)} trajectory directories.")
+
+        # Pre-calculate total episodes to process for __len__
+        self.total_episodes_to_process = 0
+        for traj_dir in self.trajectory_dirs:
             try:
-                rel_path = d.relative_to(self.data_path)
-                if str(rel_path) not in self.processed_dirs:
-                    self.trajectory_dirs.append(d)
+                rel_path = str(traj_dir.relative_to(self.data_path))
             except ValueError:
-                logging.warning(f"Path {d} is not relative to {self.data_path}. Processing it anyway.")
-                self.trajectory_dirs.append(d)
-        logging.info(f"{len(self.trajectory_dirs)} trajectories to process after filtering.")
+                rel_path = str(traj_dir)
+            
+            indices = self.processor.get_episode_indices(traj_dir)
+            for idx in indices:
+                current_id = f"{rel_path}/episode_{idx}"
+                if current_id not in self.processed_ids:
+                    self.total_episodes_to_process += 1
+        
+        logging.info(f"Total episodes to process: {self.total_episodes_to_process}")
     
     def __len__(self):
-        return len(self.trajectory_dirs)
+        return self.total_episodes_to_process
     
     def __iter__(self):
-        previous_traj_rel = None
+        previous_id = None
         
         for traj_dir in self.trajectory_dirs:
             try:
-                current_traj_rel = str(traj_dir.relative_to(self.data_path))
+                rel_path = str(traj_dir.relative_to(self.data_path))
             except ValueError:
-                current_traj_rel = str(traj_dir)
+                rel_path = str(traj_dir)
 
-            # If we are starting a new trajectory, mark the previous one as completed
-            if previous_traj_rel is not None:
-                with open(self.progress_file, "a") as f:
-                    f.write(f"{previous_traj_rel}\n")
-                self.processed_dirs.add(previous_traj_rel)
-            
-            frames = self.processor.get_trajectory_data(traj_dir)
-            try:
-                traj = VLN_N1_Traj(frames, self.get_task_idx, image_size=self.image_size)
-            except Exception as e:
-                logging.warning(f"Skipping trajectory {traj_dir} due to error: {e}")
-                continue
-            
-            yield traj
-            
-            previous_traj_rel = current_traj_rel
+            episodes = self.processor.get_episodes_data(traj_dir)
+            for frames in episodes:
+                ep_idx = frames["episode_info"]["episode_index"]
+                current_id = f"{rel_path}/episode_{ep_idx}"
+                
+                if current_id in self.processed_ids:
+                    continue
+                
+                # If we are about to yield a new one, mark the previous one as completed
+                if previous_id is not None:
+                    with open(self.progress_file, "a") as f:
+                        f.write(f"{previous_id}\n")
+                    self.processed_ids.add(previous_id)
+                    previous_id = None
+                
+                try:
+                    traj = VLN_N1_Traj(frames, self.get_task_idx, image_size=self.image_size)
+                    yield traj
+                    # If yield returns, it means the consumer has accepted the trajectory
+                    # We set previous_id to mark it as done on the NEXT iteration
+                    previous_id = current_id
+                except Exception as e:
+                    logging.warning(f"Skipping episode {current_id} due to error: {e}")
+                    continue
             
         # Mark the last trajectory as completed if we finished the loop
-        if previous_traj_rel is not None:
+        if previous_id is not None:
             with open(self.progress_file, "a") as f:
-                f.write(f"{previous_traj_rel}\n")
-            self.processed_dirs.add(previous_traj_rel)
+                f.write(f"{previous_id}\n")
+            self.processed_ids.add(previous_id)
 
     @property
     def schema(self) -> dict:
@@ -373,4 +492,4 @@ if __name__ == "__main__":
         logging.info(f"Trajectory with {len(traj)} frames.")
         for frame, task in traj:
             print(f"Frame keys: {list(frame.keys())}")
-        
+         

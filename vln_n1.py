@@ -20,6 +20,9 @@ parser = ArgumentParser(description="Port VLN-N1 dataset to LeRobotDataset forma
 parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo", help="Path to the raw VLN-N1 dataset directory")
 parser.add_argument("--output_dir", type=str, default=".", help="Path to the output LeRobotDataset directory")
 parser.add_argument("--codec", type=str, default="h264", choices=["h264", "hevc", "libsvtav1"], help="Video codec to use for encoding")
+parser.add_argument("--num_threads", type=int, default=4, help="Number of threads for image writing")
+parser.add_argument("--num_processes", type=int, default=0, help="Number of processes for image writing")
+parser.add_argument("--batch_size", type=int, default=50, help="Batch size for video encoding")
 args = parser.parse_args()
 
 use_encoding(args.codec)
@@ -30,6 +33,9 @@ def port(
     repo_id: str,
     root: str,
     traj_cls: type[Trajectories],
+    num_threads: int,
+    num_processes: int,
+    batch_size: int,
     *args, **kwargs
 ):
     """Port raw dataset to LeRobotDataset format."""
@@ -40,7 +46,8 @@ def port(
 
     if root and Path(root).exists():
         logging.info(f"Loading existing dataset from {root}")
-        lerobot_dataset = LeRobotDataset(repo_id, root=root)
+        lerobot_dataset = LeRobotDataset(repo_id, root=root, batch_encoding_size=batch_size)
+        lerobot_dataset.start_image_writer(num_processes=num_processes, num_threads=num_threads)
     else:
         logging.info(f"Creating new dataset at {root}")
         lerobot_dataset = LeRobotDataset.create(
@@ -49,9 +56,12 @@ def port(
             robot_type=traj_cls.ROBOT_TYPE,
             fps=traj_cls.FPS,
             features=features,
+            image_writer_processes=num_processes,
+            image_writer_threads=num_threads,
+            batch_encoding_size=batch_size,
         )
     
-    trajectories = traj_cls(raw_dir, get_task_idx=partial(get_task_idx, lerobot_dataset))
+    trajectories = traj_cls(raw_dir, get_task_idx=partial(get_task_idx, lerobot_dataset), features=features)
 
     start_time = time.time()
     num_episodes = len(trajectories)
@@ -66,6 +76,21 @@ def port(
 
         lerobot_dataset.save_episode()
         logging.info("Save_episode")
+
+    # Manually flush any remaining videos when batch_encoding_size > 1.
+    if lerobot_dataset.batch_encoding_size > 1 and lerobot_dataset.episodes_since_last_encoding > 0:
+        start_ep = lerobot_dataset.num_episodes - lerobot_dataset.episodes_since_last_encoding
+        logging.info(
+            f"Batch encoding remaining {lerobot_dataset.episodes_since_last_encoding} episodes "
+            f"[{start_ep}, {lerobot_dataset.num_episodes})"
+        )
+        lerobot_dataset.batch_encode_videos(start_episode=start_ep, end_episode=lerobot_dataset.num_episodes)
+        lerobot_dataset.episodes_since_last_encoding = 0
+
+    # Ensure asynchronous image writer workers finish before validation.
+    lerobot_dataset.stop_image_writer()
+    
+    
 
 
 
@@ -99,6 +124,9 @@ def main():
         repo_id=f"VLN-N1-{folder_name}",
         root=root,
         traj_cls=VLN_N1_Trajectories,
+        num_threads=args.num_threads,
+        num_processes=args.num_processes,
+        batch_size=args.batch_size,
     )
     
     validate_dataset(f"VLN-N1-{folder_name}", root=root)

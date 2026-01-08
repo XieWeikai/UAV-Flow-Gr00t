@@ -251,15 +251,8 @@ class VLN_N1_Traj(Traj):
         # compute transformation from world to c_base
         T_c_base_w = homogeneous_inv(T_w_c_base)
         
-        # last pose in c_base frame
-        last_pose = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        for idx in range(len(self.images)):
-            # ego_view
-            img = Image.open(self.images[idx])
-            img = img.resize(self.image_size)
-            img = np.array(img)
-            
-            # compute pose in c_base frame
+        def get_pose_at_index(idx):
+             # compute pose in c_base frame
             T_w_c = self._get_action(idx)  # transformation from c (current frame) to world
             T_w_c = self.roll_to_horizontal(T_w_c)  # fix the camera orientation
             T_c_base_c = T_c_base_w @ T_w_c  # transformation from c (current frame) to c_base
@@ -268,10 +261,6 @@ class VLN_N1_Traj(Traj):
             # get yaw_rel (yaw relative to c_base)
             # NOTE: The yaw I want is the yaw around the Y axis in YXZ convention
             yaw_rel, pitch_rel, roll_rel = R_rel.as_euler('YXZ', degrees=True)
-            
-            # if abs(pitch_rel) > 1e-3 or abs(roll_rel) > 1e-3:
-            #     logging.warning(f"path: {self.frames['trajectory_dir']}, frame idx: {idx}")
-            #     logging.warning(f"Expected pitch and roll to be ~0°, got pitch: {pitch_rel}°, roll: {roll_rel}°")
             
             assert abs(pitch_rel) < 1e-3, f"Expected pitch to be ~ 0°, got {pitch_rel}°"
             assert abs(roll_rel) < 1e-3, f"Expected roll to be ~ 0°, got {roll_rel}°"
@@ -282,21 +271,30 @@ class VLN_N1_Traj(Traj):
             p_c_base = p_c_base[:3] / p_c_base[3]  # back to 3d space
             x, y, z = p_c_base
             
-            # in camera base frame, +x is right, +y is up, +z is backwards
-            # # and we want to use a frame where +x is right, +y is forwards, +z is up
-            # pose = np.array([x, -z, y, yaw_rel], dtype=np.float32) # this is in our desired frame where +x is right, +y is forwards, +z is up
-
-            # NOTE: above is deprecated,
             # now we want to use a frame where +x is front, +y is left, +z is up
-            pose = np.array([-z, -x, y, yaw_rel], dtype=np.float32) # this is in our desired frame where +x is front, +y is left, +z is up
+            pose = np.array([-z, -x, y, yaw_rel], dtype=np.float32)
+            return pose
+        
+        for idx in range(len(self.images)):
+            # ego_view
+            img = Image.open(self.images[idx])
+            img = img.resize(self.image_size)
+            img = np.array(img)
             
-            # action is relative pose to last pose
-            action = self.to_4d(
-                relative_pose(
-                    self.to_6d(last_pose), 
-                    self.to_6d(pose)
+            pose = get_pose_at_index(idx)
+            
+            if idx < len(self.images) - 1:
+                next_pose = get_pose_at_index(idx + 1)
+                # action is relative pose from current to next
+                action = self.to_4d(
+                    relative_pose(
+                        self.to_6d(pose), 
+                        self.to_6d(next_pose),
+                        degree=True
+                    )
                 )
-            )
+            else:
+                action = np.zeros(4, dtype=np.float32)
             
             yield {
                 "annotation.human.action.task_description": np.array([self.task_idx], dtype=np.int32),
@@ -304,8 +302,6 @@ class VLN_N1_Traj(Traj):
                 "video.ego_view": img,
                 "action": action,
             }, self.task
-            
-            last_pose = pose
             
 
 class VLN_N1_Trajectories(Trajectories):

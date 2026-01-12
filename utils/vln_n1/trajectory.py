@@ -9,6 +9,8 @@ from utils import Trajectories, Traj
 from utils.coordinate import to_homogeneous, homogeneous_inv, relative_pose
 from scipy.spatial.transform import Rotation
 
+logging.warning("The VLN-N1 trajectory module is experimental and may contain bugs.")
+
 class InternDataProcessor:
     def __init__(self, root_path: Union[str, Path]):
         """
@@ -89,11 +91,13 @@ class InternDataProcessor:
 
         valid_ep_infos = []
         with open(episodes_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for line_num, line in enumerate(f):
                 line = line.strip()
                 if not line: continue
                 try:
                     ep_info = json.loads(line)
+                    ep_info["episode_path"] = str(episodes_path)
+                    ep_info["line_number"] = line_num + 1
                     if ep_info.get('episode_index') is not None:
                         valid_ep_infos.append(ep_info)
                 except json.JSONDecodeError:
@@ -160,6 +164,42 @@ class InternDataProcessor:
 
 from utils import Trajectories, Traj
 
+def validate_tasks(tasks: List[Dict]) -> bool:
+    instructions = tasks
+
+    try:
+        sum_instruction = None
+        for i, ins in enumerate(instructions):
+            if "sum_instruction" in ins:
+                item = instructions.pop(i)
+                sum_instruction = item["sum_instruction"]
+                break
+        
+        selected_instruction = ""
+        # 10% chance to select sum_instruction
+        if sum_instruction is not None and np.random.rand() < 0.1:
+            selected_instruction = sum_instruction
+        else:
+            found = False
+            for ins in instructions:
+                if ins["sub_indexes"][0] <= 1000 <= ins["sub_indexes"][1]:
+                    if np.random.rand() < 0.5:
+                        selected_instruction = ins["sub_instruction"]
+                    else:
+                        selected_instruction = ins["revised_sub_instruction"]
+                    found = True
+                    break
+            if not found:
+                if sum_instruction is not None:
+                    selected_instruction = sum_instruction
+                elif len(instructions) > 0:
+                    selected_instruction = instructions[-1]["sub_instruction"]
+    except Exception as e:
+        logging.warning(f"Error validating tasks: {e}")
+        return False
+
+    return True
+
 class VLN_N1_Traj(Traj):
     
     def __init__(self, frames: dict, get_task_idx: Callable[[str], int], image_size: tuple[int, int] = (256, 256)):
@@ -169,25 +209,29 @@ class VLN_N1_Traj(Traj):
         self.actions = self.df['action']
         
         if "episode_info" in frames:
-            task_data = frames["episode_info"]
-            tasks = task_data["tasks"]
-            # If tasks are strings (old format?), parse them. Otherwise assume dicts.
-            if tasks and isinstance(tasks[0], str):
-                tasks = [json.loads(j) for j in tasks]
-            tasks_str = json.dumps(tasks)
-            self.task = tasks_str
+            tasks = frames["episode_info"]["tasks"]
+            episode_path = frames["episode_info"].get("episode_path", "unknown")
+            line_number = frames["episode_info"].get("line_number", "unknown")
         else:
             # Fallback or error if episode_info is missing
             episodes_path = frames["trajectory_dir"] / "meta/episodes.jsonl"
             if not episodes_path.exists():
                 raise FileNotFoundError(f"Episodes metadata file not found: {episodes_path}")
-                
+            
             with open(episodes_path, 'r', encoding='utf-8') as f:
-                task = json.load(f)
-            task = task["tasks"]
-            tasks = [json.loads(j) for j in task]
-            tasks_str = json.dumps(tasks)
-            self.task = tasks_str
+                data = json.load(f)
+            tasks = data["tasks"]
+            episode_path = str(episodes_path)
+            line_number = 1
+
+        # If tasks are strings (old format?), parse them. Otherwise assume dicts.
+        if tasks and isinstance(tasks[0], str):
+            tasks = [json.loads(j) for j in tasks]
+            
+        if not validate_tasks(tasks):
+            logging.warning(f"Invalid tasks found in episode at {episode_path}, line {line_number}")
+
+        self.task = json.dumps(tasks)
 
         self.images = frames["images"]
         self.task_idx = get_task_idx(self.task)

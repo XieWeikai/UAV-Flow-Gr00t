@@ -1,4 +1,40 @@
 import logging
+import warnings
+from logging.handlers import RotatingFileHandler
+
+# 1. root logger：最低 INFO
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+
+# 2. 控制台 handler（INFO+）
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter(
+    "%(asctime)s %(levelname)s %(message)s"
+)
+console_handler.setFormatter(console_formatter)
+
+# 3. 文件 handler（WARNING+）
+file_handler = RotatingFileHandler(
+    "warnings.log",
+    maxBytes=50 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",   # 强烈建议
+)
+file_handler.setLevel(logging.WARNING)
+file_formatter = logging.Formatter(
+    "%(asctime)s %(levelname)s %(message)s"
+)
+file_handler.setFormatter(file_formatter)
+
+# 4. 挂 handler（避免重复挂）
+root.handlers.clear()
+root.addHandler(console_handler)
+root.addHandler(file_handler)
+
+# 5. 捕获 warnings.warn
+logging.captureWarnings(True)
+
 import time
 from pathlib import Path
 
@@ -11,10 +47,6 @@ from argparse import ArgumentParser
 
 from utils.video import use_encoding
 
-logging.basicConfig(
-    level=logging.INFO,      # 把门槛降到 INFO
-    format='%(asctime)s %(levelname)s %(message)s'
-)
 
 parser = ArgumentParser(description="Port VLN-N1 dataset to LeRobotDataset format")
 parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo", help="Path to the raw VLN-N1 dataset directory")

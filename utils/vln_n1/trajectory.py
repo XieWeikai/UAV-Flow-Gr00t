@@ -8,8 +8,11 @@ import json
 from utils import Trajectories, Traj
 from utils.coordinate import to_homogeneous, homogeneous_inv, relative_pose
 from scipy.spatial.transform import Rotation
+from tqdm import tqdm
+import multiprocessing
 
-logging.warning("The VLN-N1 trajectory module is experimental and may contain bugs.")
+if multiprocessing.current_process().name == 'MainProcess':
+    logging.warning("The VLN-N1 trajectory module is experimental and may contain bugs.")
 
 class InternDataProcessor:
     def __init__(self, root_path: Union[str, Path]):
@@ -34,20 +37,31 @@ class InternDataProcessor:
     #     return traj_dirs
 
     # NOTE: It is not always 'trajectory_*', so we generalize the search
-    def get_trajectory_dirs(self) -> List[Path]:
+    def get_trajectory_dirs(self, limit: int = None) -> List[Path]:
         """
         Collect all directories that directly contain
         'data', 'meta', and 'videos' subdirectories.
         """
         traj_dirs = []
 
-        for d in self.root_path.rglob("*"):
-            if not d.is_dir():
-                continue
+        # Added tqdm to show progress during directory scanning
+        # for d in tqdm(self.root_path.rglob("*"), desc="Scanning directories"):
+        #     if not d.is_dir():
+        #         continue
+
+        #     subdirs = {p.name for p in d.iterdir() if p.is_dir()}
+        #     if {"data", "meta", "videos"}.issubset(subdirs):
+        #         traj_dirs.append(d)
+        #         if limit is not None and len(traj_dirs) >= limit:
+        #             break
+        for meta_dir in tqdm(self.root_path.rglob("meta"), desc="Scanning directories"):
+            d = meta_dir.parent
 
             subdirs = {p.name for p in d.iterdir() if p.is_dir()}
             if {"data", "meta", "videos"}.issubset(subdirs):
                 traj_dirs.append(d)
+                if limit is not None and len(traj_dirs) >= limit:
+                    break
 
         traj_dirs.sort(key=lambda p: str(p))
 
@@ -65,7 +79,7 @@ class InternDataProcessor:
             return indices
 
         with open(episodes_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for line in tqdm(f, desc="Reading episode indices", leave=False):
                 line = line.strip()
                 if not line: continue
                 try:
@@ -91,7 +105,7 @@ class InternDataProcessor:
 
         valid_ep_infos = []
         with open(episodes_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f):
+            for line_num, line in enumerate(tqdm(f, desc="Parsing episodes JSON", leave=False)):
                 line = line.strip()
                 if not line: continue
                 try:
@@ -106,7 +120,7 @@ class InternDataProcessor:
         
         is_single_episode = (len(valid_ep_infos) == 1)
 
-        for ep_info in valid_ep_infos:
+        for ep_info in tqdm(valid_ep_infos, desc="Processing episodes data", leave=False):
             episode_index = ep_info.get('episode_index')
 
             # 1. Find parquet file
@@ -194,6 +208,11 @@ def validate_tasks(tasks: List[Dict]) -> bool:
                     selected_instruction = sum_instruction
                 elif len(instructions) > 0:
                     selected_instruction = instructions[-1]["sub_instruction"]
+                else:
+                    # Fallback failed
+                    logging.warning("validate_tasks: No instruction found and no fallback available.")
+                    return False
+                    
     except Exception as e:
         logging.warning(f"Error validating tasks: {e}")
         return False
@@ -400,7 +419,7 @@ class VLN_N1_Trajectories(Trajectories):
         
         # Try to find an image to determine size
         processor = InternDataProcessor(data_path)
-        traj_dirs = processor.get_trajectory_dirs()
+        traj_dirs = processor.get_trajectory_dirs(limit=6)
         
         if not traj_dirs:
             logging.warning(f"No trajectories found in {data_path}. Using default resolution (256, 256).")
@@ -454,7 +473,7 @@ class VLN_N1_Trajectories(Trajectories):
 
         # Pre-calculate total episodes to process for __len__
         self.total_episodes_to_process = 0
-        for traj_dir in self.trajectory_dirs:
+        for traj_dir in tqdm(self.trajectory_dirs, desc="Initializing trajectories"):
             try:
                 rel_path = str(traj_dir.relative_to(self.data_path))
             except ValueError:

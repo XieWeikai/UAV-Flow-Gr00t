@@ -1,6 +1,18 @@
 import logging
 import warnings
+import os
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from argparse import ArgumentParser
+from pathlib import Path
+
+# 0. Pre-parse raw_dir for log filename
+temp_parser = ArgumentParser(add_help=False)
+temp_parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo")
+known_args, _ = temp_parser.parse_known_args()
+raw_dir_name = Path(known_args.raw_dir).name
+# Clean up the name for filename safety
+raw_dir_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in raw_dir_name)
 
 # 1. root logger：最低 INFO
 root = logging.getLogger()
@@ -15,8 +27,13 @@ console_formatter = logging.Formatter(
 console_handler.setFormatter(console_formatter)
 
 # 3. 文件 handler（WARNING+）
+# 使用包含时间戳和 PID 的独立日志文件名，避免多进程冲突
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+pid = os.getpid()
+log_filename = f"warnings_{raw_dir_name}_{timestamp}_{pid}.log"
+
 file_handler = RotatingFileHandler(
-    "warnings.log",
+    log_filename,
     maxBytes=50 * 1024 * 1024,
     backupCount=5,
     encoding="utf-8",   # 强烈建议
@@ -36,6 +53,7 @@ root.addHandler(file_handler)
 logging.captureWarnings(True)
 
 import time
+import json
 from pathlib import Path
 
 
@@ -99,15 +117,30 @@ def port(
     num_episodes = len(trajectories)
     logging.info(f"Number of episodes {num_episodes}")
 
-    for episode_index, episode in enumerate(trajectories, start=1):
-        elapsed_time = time.time() - start_time
-        logging.info(f"{episode_index} / {num_episodes} episodes processed (after {elapsed_time:.3f} seconds)")
+    ensure_meta_dir = lerobot_dataset.root / "meta"
+    ensure_meta_dir.mkdir(parents=True, exist_ok=True)
+    extras_path = ensure_meta_dir / "episodes_extras.jsonl"
 
-        for frame, task in episode:
-            lerobot_dataset.add_frame(frame, task=task)
+    with open(extras_path, "a", encoding="utf-8") as extras_file:
+        for episode_index, episode in enumerate(trajectories):
+            elapsed_time = time.time() - start_time
+            logging.info(f"{episode_index + 1} / {num_episodes} episodes processed (after {elapsed_time:.3f} seconds)")
 
-        lerobot_dataset.save_episode()
-        logging.info("Save_episode")
+            for frame, task in episode:
+                lerobot_dataset.add_frame(frame, task=task)
+
+            lerobot_dataset.save_episode()
+            logging.info("Save_episode")
+
+            # Save extra metadata
+            ep_idx = lerobot_dataset.num_episodes - 1
+            
+            extra_data = {"episode_index": ep_idx}
+            # Merge with trajectory metadata if available
+            extra_data.update(episode.metadata)
+
+            extras_file.write(json.dumps(extra_data) + "\n")
+            extras_file.flush()
 
     # Manually flush any remaining videos when batch_encoding_size > 1.
     if lerobot_dataset.batch_encoding_size > 1 and lerobot_dataset.episodes_since_last_encoding > 0:

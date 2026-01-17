@@ -21,6 +21,11 @@ class Traj:
 
     def __iter__(self):
         raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
+    
+    @property
+    def metadata(self) -> dict:
+        """Return metadata for the trajectory."""
+        raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
 
 class Trajectories(ABC):
     """

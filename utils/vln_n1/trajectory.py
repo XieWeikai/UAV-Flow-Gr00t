@@ -1,6 +1,8 @@
+import cv2
 from pathlib import Path
 from typing import Callable, List, Dict, Union
 import numpy as np
+import traceback
 from PIL import Image
 import logging
 import pandas as pd
@@ -13,6 +15,8 @@ import multiprocessing
 
 if multiprocessing.current_process().name == 'MainProcess':
     logging.warning("The VLN-N1 trajectory module is experimental and may contain bugs.")
+
+
 
 class InternDataProcessor:
     def __init__(self, root_path: Union[str, Path]):
@@ -87,8 +91,48 @@ class InternDataProcessor:
                     if 'episode_index' in ep_info:
                         indices.append(ep_info['episode_index'])
                 except json.JSONDecodeError:
+                    traceback.print_exc()
                     continue
         return indices
+
+    def _collect_images(self, trajectory_dir: Path, folder_name: str, episode_index: int, is_single_episode: bool, extensions: List[str]) -> tuple[List[Path], Union[Path, None]]:
+        target_dirs = list(trajectory_dir.rglob(folder_name))
+        target_dir = target_dirs[0] if target_dirs else None
+        
+        if not target_dir or not target_dir.exists():
+            return [], None
+
+        prefix = f"episode_{episode_index:06d}_"
+        images = []
+        files = []
+
+        # Try extensions in order
+        for ext in extensions:
+            files = list(target_dir.glob(f"{prefix}*{ext}"))
+            if files:
+                break
+        
+        if files:
+            try:
+                images = sorted(files, key=lambda x: int(x.stem.split('_')[-1]))
+            except ValueError:
+                traceback.print_exc()
+                images = sorted(files)
+        elif is_single_episode:
+             # Fallback
+            for ext in extensions:
+                 files = list(target_dir.glob(f"*{ext}"))
+                 if files:
+                     break
+            
+            if files: 
+                 try:
+                    images = sorted(files, key=lambda x: int(x.stem))
+                 except ValueError:
+                    traceback.print_exc()
+                    images = sorted(files)
+
+        return images, target_dir
 
     def get_episodes_data(self, trajectory_dir: Union[str, Path]) -> List[Dict]:
         """
@@ -115,6 +159,7 @@ class InternDataProcessor:
                     if ep_info.get('episode_index') is not None:
                         valid_ep_infos.append(ep_info)
                 except json.JSONDecodeError:
+                    traceback.print_exc()
                     logging.warning(f"Failed to decode JSON line in {episodes_path}: {line}")
                     continue
         
@@ -133,43 +178,32 @@ class InternDataProcessor:
                 logging.warning(f"Parquet file {parquet_name} not found in {trajectory_dir}")
                 continue
 
-            # 2. Find images directory
-            images_dirs = list(trajectory_dir.rglob("observation.images.rgb"))
-            images_dir = images_dirs[0] if images_dirs else None
-
-            # 3. Get all images for this episode
-            images = []
-            if images_dir and images_dir.exists():
-                prefix = f"episode_{episode_index:06d}_"
-                jpg_files = list(images_dir.glob(f"{prefix}*.jpg"))
-                
-                if jpg_files:
-                    try:
-                        # Sort by the frame index at the end
-                        images = sorted(jpg_files, key=lambda x: int(x.stem.split('_')[-1]))
-                    except ValueError:
-                        images = sorted(jpg_files)
-                elif is_single_episode:
-                    # Fallback only if single episode
-                    jpg_files = list(images_dir.glob("*.jpg"))
-                    try:
-                        images = sorted(jpg_files, key=lambda x: int(x.stem))
-                    except ValueError:
-                        images = sorted(jpg_files)
-                    
-                    if not images:
-                         raise FileNotFoundError(f"No images found for single episode {episode_index} in {images_dir}")
-                else:
-                    raise FileNotFoundError(f"No images found with prefix {prefix} for episode {episode_index} in {images_dir} (multiple episodes present)")
-            else:
+            # 2. Get RGB images
+            images, images_dir = self._collect_images(trajectory_dir, "observation.images.rgb", episode_index, is_single_episode, ['.jpg', '.png'])
+            
+            if not images_dir:
                  logging.warning(f"Images directory not found in {trajectory_dir}")
                  continue
+
+            if not images:
+                 raise FileNotFoundError(f"No images found for episode {episode_index} in {images_dir}")
+
+            # 3. Get Depth images
+            depth_images, depth_images_dir = self._collect_images(trajectory_dir, "observation.images.depth", episode_index, is_single_episode, ['.png', '.jpg'])
+
+            if not depth_images_dir:
+                 logging.warning(f"Depth images directory not found in {trajectory_dir}")
+                 continue
+
+            if not depth_images:
+                 raise FileNotFoundError(f"No depth images found for episode {episode_index} in {depth_images_dir}")
 
             episodes_data.append({
                 "trajectory_dir": trajectory_dir,
                 "parquet_path": parquet_path,
                 "images_dir": images_dir,
                 "images": images,
+                "depth_images": depth_images, 
                 "episode_info": ep_info
             })
 
@@ -214,10 +248,14 @@ def validate_tasks(tasks: List[Dict]) -> bool:
                     return False
                     
     except Exception as e:
+        traceback.print_exc()
         logging.warning(f"Error validating tasks: {e}")
         return False
 
     return True
+
+EDGE_PIX = 20     # 与边界距离阈值
+PATCH_R = 5      # Patch 半径，用于遮挡判断
 
 class VLN_N1_Traj(Traj):
     
@@ -225,7 +263,28 @@ class VLN_N1_Traj(Traj):
         self.frames = frames
         self.image_size = image_size
         self.df = pd.read_parquet(frames["parquet_path"])
-        self.actions = self.df['action']
+        self.actions = self.df["action"]
+        self.K = self._get_intrinsics(0)
+
+        # camera coordinate at the first frame
+        T_w_c = self._get_action(0)
+
+        # camera coordinate after rolling z (-z is camera forward direction) to horizontal
+        T_w_c_horizontal = self.roll_to_horizontal(T_w_c)
+
+        # body coordinate: +x forward, +y left, +z up
+        # camera coordinate: +x right, +y up, +z backwards
+        T_w_b = T_w_c_horizontal.copy()
+        T_w_b[:3, 0] = -T_w_c_horizontal[:3, 2]  # body +x = camera -z
+        T_w_b[:3, 1] = -T_w_c_horizontal[:3, 0]   # body +y = camera -x
+        T_w_b[:3, 2] = T_w_c_horizontal[:3, 1]    # body +z = camera +y
+
+        T_b_w = homogeneous_inv(T_w_b)
+        T_b_c = T_b_w @ T_w_c
+
+        self.T_b_c = T_b_c
+        
+
         
         if "episode_info" in frames:
             tasks = frames["episode_info"]["tasks"]
@@ -248,18 +307,75 @@ class VLN_N1_Traj(Traj):
             tasks = [json.loads(j) for j in tasks]
             
         if not validate_tasks(tasks):
-            logging.warning(f"Invalid tasks found in episode at {episode_path}, line {line_number}")
+            raise ValueError(f"Invalid tasks found in episode at {episode_path}, line {line_number}")
 
         self.task = json.dumps(tasks)
 
         self.images = frames["images"]
+        self.depth_images = frames["depth_images"]
         self.task_idx = get_task_idx(self.task)
         
         assert len(self.images) == len(self.df), "Number of images and dataframe rows must match."
+        assert len(self.depth_images) == len(self.images), f"Number of depth images ({len(self.depth_images)}) must match RGB images ({len(self.images)})."
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "K": self.K.tolist(),
+            "T_b_c": self.T_b_c.tolist(),
+        }
+
 
     def __len__(self):
         return len(self.images)
     
+    @staticmethod
+    def load_depth(depth_path: str) -> np.ndarray:
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            raise FileNotFoundError(depth_path)
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        return depth.astype(np.float32) * 0.0001
+
+    @staticmethod
+    def project_camera_point(Xc: np.ndarray, K: np.ndarray, image_shape: tuple):
+        """
+        Project a 3D point in camera coordinates to 2D pixel coordinates.
+        Xc: (X, Y, Z) in camera coordinates where +x is right, +y is up, +z is backwards
+        K: Intrinsic camera matrix
+        image_shape: (height, width)
+        Returns: (u, v, depth) where (u, v) are pixel coordinates and depth is the depth value
+        """
+
+        H, W = image_shape
+        X, Y, Z = Xc
+        depth = -Z
+        if depth <= 0:
+            return None  # 点在相机后侧或深度无效
+
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        u = X * fx / depth + cx
+        v = H - 1 - (Y * fy / depth + cy)
+        return u, v, depth
+    
+    @staticmethod
+    def is_collision_within_patch(depth, u, v, depth_proj, H, W):
+        ui, vi = int(u), int(v)
+        u0 = max(0, ui - PATCH_R)
+        u1 = min(W - 1, ui + PATCH_R)
+        v0 = max(0, vi - PATCH_R)
+        v1 = min(H - 1, vi + PATCH_R)
+        # print(f"ui: {ui}, vi: {vi}, u0: {u0}, u1: {u1}, v0: {v0}, v1: {v1} H: {H}, W: {W} depth shape: {depth.shape}")
+        patch = depth[v0:v1+1, u0:u1+1]
+        min_patch_depth = patch.min()
+        return min_patch_depth <= depth_proj
+
+    @staticmethod
+    def is_near_edge(u, v, H, W, edge_pix=EDGE_PIX):
+        return (u < edge_pix) or (u > W - edge_pix) or (v < edge_pix) or (v > H - edge_pix)
     
     def roll_to_horizontal(self, T: np.ndarray) -> np.ndarray:
         R = T[:3, :3]
@@ -294,7 +410,6 @@ class VLN_N1_Traj(Traj):
         assert pose_6d.shape == (6,), "Input pose must be of shape (6,)"
         x, y, z, roll, pitch, yaw = pose_6d
         return np.array([x, y, z, yaw], dtype=np.float32)
-        
     
     def _get_action(self, idx: int) -> np.ndarray:
         action = self.actions[idx]
@@ -306,6 +421,63 @@ class VLN_N1_Traj(Traj):
         # print(f"processed_action: {processed_action} type: {type(processed_action)}")
         return processed_action
 
+    def _get_intrinsics(self, idx: int) -> np.ndarray:
+        K = self.df["observation.camera_intrinsic"][idx]
+        if K.shape == (9,): # flattened 3x3 matrix
+            K = K.reshape((3,3))
+        K = np.vstack(K).astype(np.float32)
+        return K
+
+    def find_farthest_visible_frame(self, current_idx: int) -> tuple[int, np.ndarray]:
+        """
+        From the current frame index, find the farthest frame index
+        that is still visible (not occluded) from the current frame.
+        """
+        W, H = self.image_size
+        K = self.K
+        T_w_c_current = self._get_action(current_idx)
+        T_c_current_w = homogeneous_inv(T_w_c_current)
+
+        # Pre-load depth image at current frame
+        depth_img_path = self.depth_images[current_idx]
+        depth_img = self.load_depth(depth_img_path)
+
+        farthest_idx = current_idx
+        farthest_T_w_c = T_w_c_current
+        
+        # Binary search for the farthest visible frame
+        left, right = current_idx + 1, len(self.images) - 1
+        
+        while left <= right:
+            mid = (left + right) // 2
+            
+            T_w_c_target = self._get_action(mid)
+            T_c_current_c_target = T_c_current_w @ T_w_c_target
+
+            # Project target camera position into current camera frame
+            p_c_target_in_current = T_c_current_c_target[:3, 3]
+            proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
+            
+            # Check visibility
+            is_visible = False
+            if proj is not None:
+                u, v, depth_proj = proj
+                # Must not be near edge
+                if not self.is_near_edge(u, v, H, W):
+                    # Must not be in collision (occluded)
+                    if not self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
+                        is_visible = True
+            
+            if is_visible:
+                farthest_idx = mid
+                farthest_T_w_c = T_w_c_target
+                left = mid + 1  # try to find a farther one
+            else:
+                right = mid - 1 # blocked or out of view, try closer
+
+        return farthest_idx, farthest_T_w_c
+
+
     def __iter__(self):
         T_w_c_base = self._get_action(0) # 4x4 homogeneous transformation matrix from c_base (first frame of trajectory) to world
         
@@ -314,9 +486,8 @@ class VLN_N1_Traj(Traj):
         # compute transformation from world to c_base
         T_c_base_w = homogeneous_inv(T_w_c_base)
         
-        def get_pose_at_index(idx):
-             # compute pose in c_base frame
-            T_w_c = self._get_action(idx)  # transformation from c (current frame) to world
+        # get pose in first body frame coordinate
+        def get_first_frame_pose(T_w_c):
             T_w_c = self.roll_to_horizontal(T_w_c)  # fix the camera orientation
             T_c_base_c = T_c_base_w @ T_w_c  # transformation from c (current frame) to c_base
             R_rel = Rotation.from_matrix(T_c_base_c[:3, :3])
@@ -338,13 +509,32 @@ class VLN_N1_Traj(Traj):
             pose = np.array([-z, -x, y, yaw_rel], dtype=np.float32)
             return pose
         
+        def get_pose_at_index(idx):
+            # compute pose in c_base frame
+            T_w_c = self._get_action(idx)  # transformation from c (current frame) to world
+            return get_first_frame_pose(T_w_c)
+        
         for idx in range(len(self.images)):
             # ego_view
             img = Image.open(self.images[idx])
             img = img.resize(self.image_size)
             img = np.array(img)
+
+            # ego_view.depth
+            # depth_img = self.load_depth(self.depth_images[idx])
             
             pose = get_pose_at_index(idx)
+
+            _, farthest_T_w_c = self.find_farthest_visible_frame(idx)
+            farthest_pose = get_first_frame_pose(farthest_T_w_c)
+
+            farthest_pose_rel = self.to_4d(
+                relative_pose(
+                    self.to_6d(pose), 
+                    self.to_6d(farthest_pose),
+                    degree=True
+                )
+            )
             
             if idx < len(self.images) - 1:
                 next_pose = get_pose_at_index(idx + 1)
@@ -363,7 +553,11 @@ class VLN_N1_Traj(Traj):
                 "annotation.human.action.task_description": np.array([self.task_idx], dtype=np.int32),
                 "observation.state": pose,
                 "video.ego_view": img,
-                "action": action,
+                # "observation.ego_view.depth": depth_img,
+
+                # first 4 values are [dx, dy, dz, dyaw] to the next frame
+                # last 4 values are relative pose of the farthest visible frame to the current frame
+                "action": np.concatenate([action, farthest_pose_rel])
             }, self.task
             
 
@@ -387,6 +581,14 @@ class VLN_N1_Trajectories(Trajectories):
                 "axes": ["x", "y", "z", "yaw"],
             },
         },
+        # "observation.ego_view.depth": {
+        #     "dtype": "uint16",
+        #     "shape": (256, 256),
+        #     "names": [
+        #         "height",
+        #         "width",
+        #     ],
+        # },
         # The primary video feed from the drone's ego-centric camera.
         "video.ego_view": {
             "dtype": "video",
@@ -398,11 +600,13 @@ class VLN_N1_Trajectories(Trajectories):
             ],
         },
         # The action command sent to the drone.
+        # first 4 values are [dx, dy, dz, dyaw] to the next frame
+        # last 4 values are relative pose of the farthest visible frame to the current frame
         "action": {
             "dtype": "float32",
-            "shape": (4,),
+            "shape": (8,),
             "names": {
-                "axes": ["x", "y", "z", "yaw"],
+                "axes": ["x", "y", "z", "yaw", "farthest_x", "farthest_y", "farthest_z", "farthest_yaw"],
             },
         },
     }
@@ -435,10 +639,13 @@ class VLN_N1_Trajectories(Trajectories):
                         width, height = img.size
                         features["video.ego_view"]["shape"] = (height, width, 3)
                         features["video.ego_view"]["names"] = ["height", "width", "channels"]
+                        # features["observation.ego_view.depth"]["shape"] = (height, width)
+                        # features["observation.ego_view.depth"]["names"] = ["height", "width"]
                         logging.info(f"Determined video resolution from data: {width}x{height}")
                         found_image = True
                         break
                 except Exception as e:
+                    traceback.print_exc()
                     logging.warning(f"Failed to read image size from {episodes[0]['images'][0]}: {e}")
         
         if not found_image:
@@ -521,6 +728,7 @@ class VLN_N1_Trajectories(Trajectories):
                     # We set previous_id to mark it as done on the NEXT iteration
                     previous_id = current_id
                 except Exception as e:
+                    traceback.print_exc()
                     logging.warning(f"Skipping episode {current_id} due to error: {e}")
                     continue
             

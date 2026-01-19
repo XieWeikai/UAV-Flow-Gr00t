@@ -16,3 +16,6 @@ UAVFlow*/
 **/*.mp4
 *.ipynb
 **/tmp/
+
+VLN*/
+test*/

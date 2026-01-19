@@ -4502,7 +4502,7 @@ dev = [
 requires-dist = [
     { name = "ffmpeg", specifier = ">=1.4" },
     { name = "json-numpy", specifier = ">=2.1.1" },
-    { name = "lerobot", specifier = ">=0.3.3" },
+    { name = "lerobot", specifier = "==0.3.3" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },

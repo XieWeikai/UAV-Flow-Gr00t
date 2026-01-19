@@ -389,6 +389,8 @@ class VLN_N1_Traj(Traj):
         # so we fix this by rolling 90°
         roll = 90.0
         R = Rotation.from_euler('ZYX', [yaw, pitch, roll], degrees=True).as_matrix()
+        # NOTE: preventing modifying the input T in-place
+        T = T.copy()
         T[:3, :3] = R # now we have a horizontal camera frame
         return T
     

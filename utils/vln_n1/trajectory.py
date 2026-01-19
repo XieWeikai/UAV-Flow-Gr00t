@@ -314,7 +314,12 @@ class VLN_N1_Traj(Traj):
             tasks = [json.loads(j) for j in tasks]
 
         # keep track of sub_indexes for each task. useful for finding farthest visible frame
-        sub_indexes = [task["sub_indexes"] for task in tasks]
+        sub_indexes = []
+        for task in tasks:
+            if "sub_indexes" in task:
+                sub_indexes.append(task["sub_indexes"])
+            if "sum_indexes" in task:
+                sub_indexes.append(task["sum_indexes"])
         # sort by end index
         sub_indexes.sort(key=lambda x: x[1])
         self.sub_indexes = sub_indexes

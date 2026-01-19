@@ -257,6 +257,9 @@ def validate_tasks(tasks: List[Dict]) -> bool:
 EDGE_PIX = 20     # 与边界距离阈值
 PATCH_R = 5      # Patch 半径，用于遮挡判断
 
+class Ignore(Exception):
+    pass
+
 class VLN_N1_Traj(Traj):
     
     def __init__(self, frames: dict, get_task_idx: Callable[[str], int], image_size: tuple[int, int] = (256, 256)):
@@ -268,6 +271,10 @@ class VLN_N1_Traj(Traj):
 
         # camera coordinate at the first frame
         T_w_c = self._get_action(0)
+
+        _, _, roll = self.get_euler(T_w_c)
+        if abs(90.0 - roll) > 5.0:
+            raise Ignore(f"Unexpected roll angle: {roll}°. Expected 85~95°.")
 
         # camera coordinate after rolling z (-z is camera forward direction) to horizontal
         T_w_c_horizontal = self.roll_to_horizontal(T_w_c)
@@ -305,9 +312,16 @@ class VLN_N1_Traj(Traj):
         # If tasks are strings (old format?), parse them. Otherwise assume dicts.
         if tasks and isinstance(tasks[0], str):
             tasks = [json.loads(j) for j in tasks]
+
+        # keep track of sub_indexes for each task. useful for finding farthest visible frame
+        sub_indexes = [task["sub_indexes"] for task in tasks]
+        # sort by end index
+        sub_indexes.sort(key=lambda x: x[1])
+        self.sub_indexes = sub_indexes
             
         if not validate_tasks(tasks):
             raise ValueError(f"Invalid tasks found in episode at {episode_path}, line {line_number}")
+
 
         self.task = json.dumps(tasks)
 
@@ -359,6 +373,9 @@ class VLN_N1_Traj(Traj):
 
         u = X * fx / depth + cx
         v = H - 1 - (Y * fy / depth + cy)
+
+        if u < 0 or u >= W or v < 0 or v >= H:
+            return None  # 投影点在图像外
         return u, v, depth
     
     @staticmethod
@@ -377,9 +394,15 @@ class VLN_N1_Traj(Traj):
     def is_near_edge(u, v, H, W, edge_pix=EDGE_PIX):
         return (u < edge_pix) or (u > W - edge_pix) or (v < edge_pix) or (v > H - edge_pix)
     
-    def roll_to_horizontal(self, T: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def get_euler(T: np.ndarray) -> tuple[float, float, float]:
         R = T[:3, :3]
         yaw, pitch, roll = Rotation.from_matrix(R).as_euler('ZYX', degrees=True)
+        return yaw, pitch, roll
+
+    def roll_to_horizontal(self, T: np.ndarray) -> np.ndarray:
+        R = T[:3, :3]
+        yaw, pitch, roll = self.get_euler(T)
         
         assert abs(pitch) < 1e-3, f"Expected pitch to be ~ 0°, got {pitch}°"
         
@@ -447,35 +470,44 @@ class VLN_N1_Traj(Traj):
         farthest_idx = current_idx
         farthest_T_w_c = T_w_c_current
         
-        # Binary search for the farthest visible frame
-        left, right = current_idx + 1, len(self.images) - 1
+        # Determine search range based on sub_indexes
+        search_end = len(self.images) - 1
+        for start, end in self.sub_indexes:
+            if start <= current_idx <= end:
+                search_end = end
+                break
         
-        while left <= right:
-            mid = (left + right) // 2
-            
-            T_w_c_target = self._get_action(mid)
+        # Search backwards from search_end to current_idx for the first visible frame (ignoring edge constraints)
+        visible_idx = -1
+        for idx in range(search_end, current_idx, -1):
+            T_w_c_target = self._get_action(idx)
             T_c_current_c_target = T_c_current_w @ T_w_c_target
-
             # Project target camera position into current camera frame
             p_c_target_in_current = T_c_current_c_target[:3, 3]
             proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
             
-            # Check visibility
-            is_visible = False
             if proj is not None:
                 u, v, depth_proj = proj
-                # Must not be near edge
-                if not self.is_near_edge(u, v, H, W):
-                    # Must not be in collision (occluded)
-                    if not self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
-                        is_visible = True
-            
-            if is_visible:
-                farthest_idx = mid
-                farthest_T_w_c = T_w_c_target
-                left = mid + 1  # try to find a farther one
-            else:
-                right = mid - 1 # blocked or out of view, try closer
+                # Check collision (occlusion)
+                if not self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
+                    visible_idx = idx
+                    break
+        
+        # If a visible frame is found, search backwards from there for the first frame that is not near the edge
+        if visible_idx != -1:
+            for idx in range(visible_idx, current_idx, -1):
+                T_w_c_target = self._get_action(idx)
+                T_c_current_c_target = T_c_current_w @ T_w_c_target
+                p_c_target_in_current = T_c_current_c_target[:3, 3]
+                proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
+                
+                if proj is not None:
+                    u, v, depth_proj = proj
+                    # Check edge constraint
+                    if not self.is_near_edge(u, v, H, W):
+                        farthest_idx = idx
+                        farthest_T_w_c = T_w_c_target
+                        break
 
         return farthest_idx, farthest_T_w_c
 
@@ -729,6 +761,9 @@ class VLN_N1_Trajectories(Trajectories):
                     # If yield returns, it means the consumer has accepted the trajectory
                     # We set previous_id to mark it as done on the NEXT iteration
                     previous_id = current_id
+                except Ignore as ig:
+                    logging.info(f"Skipping episode {current_id}: {ig}")
+                    continue
                 except Exception as e:
                     traceback.print_exc()
                     logging.warning(f"Skipping episode {current_id} due to error: {e}")

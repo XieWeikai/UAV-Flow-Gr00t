@@ -9,7 +9,8 @@ H = 270
 W = 480
 
 # parquet_path = "/home/ubuntu/xwk/projects/UAV-Flow-Gr00t/test_data/data/chunk-000/episode_000000.parquet"
-parquet_path = "/data-25T/InternData-N1/hssd_d435i/102344280__d2d2d5fd7e/102344280/data/chunk-000/episode_000000.parquet"
+# parquet_path = "/data-25T/InternData-N1/hssd_d435i/102344280__d2d2d5fd7e/102344280/data/chunk-000/episode_000000.parquet"
+parquet_path = "/data3/InternData-N1/hm3d_d435i/00001-UVdNNRcVyV1__8b94c4e2ac/00001-UVdNNRcVyV1/data/chunk-000/episode_000000.parquet"
 
 df = pd.read_parquet(parquet_path)
 
@@ -107,7 +108,7 @@ if __name__ == "__main__":
 
     T_w_c0 = get_T_w_c(0)
     T_c0_w = homogeneous_inv(T_w_c0)
-    for i in range(1, 30):
+    for i in range(1, len(df)):
         T_w_ci = get_T_w_c(i)
 
 
@@ -122,7 +123,7 @@ if __name__ == "__main__":
         
         T_w_b0, _, _ = get_T_w_b(T_w_c0)
         T_w_bi, yaw, roll = get_T_w_b(T_w_ci)
-        T_w_bi[2, 2] = 0.0  # set z to 0 (ground level)
+        T_w_bi[2, 3] = 0.0  # set z to 0 (ground level)
         T_b0_w = homogeneous_inv(T_w_b0)
         T_b0_bi = T_b0_w @ T_w_bi
         t_bi = t(T_b0_bi)

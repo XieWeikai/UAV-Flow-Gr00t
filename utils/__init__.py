@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Iterable, Tuple
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 def get_task_idx(ds: LeRobotDataset, task: str) -> int:
@@ -16,10 +17,10 @@ class Traj:
     def __init__(self, frames):
         raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
 
-    def __len__(self):
+    def __len__(self)-> int:
         raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
 
-    def __iter__(self):
+    def __iter__(self) -> Iterable[Tuple[dict, str]]:
         raise NotImplementedError("Traj is an abstract class and cannot be instantiated directly.")
     
     @property
@@ -39,10 +40,10 @@ class Trajectories(ABC):
     def __init__(self, data_path: str):
         raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")
 
-    def __len__(self):
+    def __len__(self)-> int:
         raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")
 
-    def __iter__(self):
+    def __iter__(self)-> Iterable[Traj]:
         raise NotImplementedError("Trajectories is an abstract class and cannot be instantiated directly.")
     
     @property

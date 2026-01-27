@@ -108,23 +108,57 @@ def to_homogeneous(points: np.array, is_point=True) -> np.array:
     return points
     
 
-def homogeneous_inv(T: np.array) -> np.array:
-    """
-    Inverts a homogeneous transformation matrix.
-    Args:
-        T (np.array): 4x4 homogeneous transformation matrix.
-    Returns:
-        np.array: 4x4 inverted transformation matrix.
-    """
-    R = T[0:3, 0:3]
-    t = T[0:3, 3]
-    R_inv = R.T
-    t_inv = -R_inv @ t
-    T_inv = np.eye(4)
-    T_inv[0:3, 0:3] = R_inv
-    T_inv[0:3, 3] = t_inv
-    return T_inv
+# def homogeneous_inv(T: np.array) -> np.array:
+#     """
+#     Inverts a homogeneous transformation matrix.
+#     Args:
+#         T (np.array): 4x4 homogeneous transformation matrix.
+#     Returns:
+#         np.array: 4x4 inverted transformation matrix.
+#     """
+#     R = T[0:3, 0:3]
+#     t = T[0:3, 3]
+#     R_inv = R.T
+#     t_inv = -R_inv @ t
+#     T_inv = np.eye(4)
+#     T_inv[0:3, 0:3] = R_inv
+#     T_inv[0:3, 3] = t_inv
+#     return T_inv
 
+def homogeneous_inv(T: np.ndarray) -> np.ndarray:
+    """
+    Inverts a homogeneous transformation matrix or a batch of them.
+
+    Args:
+        T (np.ndarray): shape (4, 4) or (B, 4, 4)
+
+    Returns:
+        np.ndarray: inverted transform(s), same shape as input
+    """
+    T = np.asarray(T)
+    single = False
+
+    if T.ndim == 2:
+        # (4, 4) -> (1, 4, 4)
+        T = T[None, ...]
+        single = True
+    elif T.ndim != 3 or T.shape[-2:] != (4, 4):
+        raise ValueError(f"Expected shape (4,4) or (B,4,4), got {T.shape}")
+
+    R = T[:, :3, :3]          # (B, 3, 3)
+    t = T[:, :3, 3]           # (B, 3)
+
+    R_inv = np.transpose(R, (0, 2, 1))          # (B, 3, 3)
+    t_inv = -np.einsum('bij,bj->bi', R_inv, t)  # (B, 3)
+
+    T_inv = np.zeros_like(T)
+    T_inv[:, :3, :3] = R_inv
+    T_inv[:, :3, 3] = t_inv
+    T_inv[:, 3, 3] = 1.0
+
+    if single:
+        return T_inv[0]
+    return T_inv
 
 def dict_to_array(p: dict) -> np.array:
     return np.array([p[key] * sign[key] for key in indices.keys()])

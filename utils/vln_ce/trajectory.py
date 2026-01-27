@@ -28,6 +28,13 @@ class VLN_CE_Traj(Traj):
        [ 0.,  0.,  0.,  1.]
     ], dtype=np.float32)
 
+    goal_keys = [
+        "relative_goal_frame_id.125cm_45deg",
+        "relative_goal_frame_id.125cm_30deg",
+        "relative_goal_frame_id.60cm_30deg",
+        "relative_goal_frame_id.60cm_15deg",
+    ]
+
     @property
     def metadata(self) -> dict:
         return {
@@ -42,13 +49,11 @@ class VLN_CE_Traj(Traj):
         
         # Read parquet
         self.df = pd.read_parquet(self.parquet_path)
+
+        assert len(self.df) == len(self.images), \
+            f"Length mismatch between parquet {len(self.df)} and images {len(self.images)} in {self.parquet_path}"
         
-        # Validation: Trim to minimum length if mismatch
-        min_len = min(len(self.df), len(self.images))
-        if len(self.df) != len(self.images):
-            self.df = self.df.iloc[:min_len]
-            self.images = self.images[:min_len]
-        self.length = min_len
+        self.length = len(self.df)
         
         # Process Poses
         # Ensure it's a stacked numpy array [N, 4, 4]
@@ -83,7 +88,15 @@ class VLN_CE_Traj(Traj):
         self.action_deltas = np.concatenate([deltas, last_delta], axis=0) # [N, 4]
         
         # Calculate Goal Actions (last 4 values)
-        goal_frame_idx = self.df["relative_goal_frame_id.125cm_45deg"].to_numpy()
+        goal_frame_idx = None
+        for key in self.goal_keys:
+            if key in self.df.columns:
+                goal_frame_idx = self.df[key].to_numpy()
+                break
+        
+        if goal_frame_idx is None:
+            raise KeyError(f"None of the goal keys {self.goal_keys} found in dataframe columns: {self.df.columns}")
+
         actions_raw = self.df["action"].to_numpy()
         refined_goals = goal_frame_idx.copy()
         N = self.length
@@ -260,7 +273,18 @@ class VLN_CE_Trajectories(Trajectories):
                 key=lambda p: int(p.stem.split("_")[-1])
             )
 
-            yield VLN_CE_Traj(parquet_file, images, task=task, task_idx=task_idx)
+            try:
+                traj = VLN_CE_Traj(parquet_file, images, task=task, task_idx=task_idx)
+                yield traj
+            except Exception:
+                print(f"Failed to load trajectory from {parquet_file}")
+                import traceback
+                traceback.print_exc()
+                with open("error_log.txt", "a") as log_file:
+                    log_file.write(f"Failed to load trajectory from {parquet_file}\n")
+                    log_file.write(traceback.format_exc())
+                    log_file.write("\n")
+                continue
 
     @property
     def schema(self) -> dict:

@@ -14,6 +14,7 @@ import scipy.ndimage
 from utils import Traj, Trajectories
 from scipy.spatial.transform import Rotation
 from utils.coordinate import homogeneous_inv, get_poses, PointCloudESDF
+from utils.obstacle import compute_collision_prob, compute_yaw_rate
 
 def validate_tasks(tasks: List[Dict]) -> bool:
     instructions = tasks
@@ -65,13 +66,17 @@ class Ignore(Exception):
 class VLN_N1_V2_Traj(Traj):
     PATCH_SIZE = 11
     EDGE = 20
+    COLLISION_THRESHOLD = 0.8
+    SMOOTH_WINDOW = 10
+    DT = 0.1 # 1 / 10 FPS
+    
     _filter: Optional[Callable[["VLN_N1_V2_Traj"], None]] = None
 
     @classmethod
     def set_filter(cls, filter: Callable[["VLN_N1_V2_Traj"], None]):
         cls._filter = filter
 
-    def __init__(self, parquet_path: Path, pcd_path: Path, images: List[Path], depth_images: List[Path], task: str, task_idx: int):
+    def __init__(self, parquet_path: Path, esdf: PointCloudESDF, images: List[Path], depth_images: List[Path], task: str, task_idx: int):
         self.df = pd.read_parquet(parquet_path)
 
         # intrinsic matrix 3x3
@@ -86,9 +91,7 @@ class VLN_N1_V2_Traj(Traj):
         self.T_b_c, self.T_c_b, self.ori_roll = VLN_N1_V2_Traj._compute_T_b_c_and_T_c_b(T_w_c)
 
         # pointcloud
-        self.pcd_path = pcd_path
-        self.pcd = o3d.io.read_point_cloud(str(pcd_path))
-        self.esdf = PointCloudESDF(self.pcd, device="cuda:0")
+        self.esdf = esdf
 
         # images and other data
         self.images = images
@@ -232,7 +235,26 @@ class VLN_N1_V2_Traj(Traj):
         # poses in the body0 frame [N, 4]
         # each row: x, y, z (m), yaw (deg)
         state = get_poses(T_b0_b)
-        self.state = state
+        
+        poses_world = get_poses(T_w_b)
+        
+        # 1. Collision Probability
+        probs = compute_collision_prob(poses_world, self.esdf, dt=self.DT)
+        
+        # 2. Yaw Rate (deg/s)
+        # Using body frame yaw or world frame yaw? compute_yaw_rate expects yaw series.
+        # poses_world[:, 3] is yaw in degrees.
+        yaw_rates = compute_yaw_rate(poses_world[:, 3], dt=self.DT, smoothing_window=self.SMOOTH_WINDOW)
+        
+        # 3. Filter
+        # If prob > threshold, use yaw_rate, else 0.0
+        collision_yaw_rate = np.zeros_like(yaw_rates)
+        mask = probs > self.COLLISION_THRESHOLD
+        collision_yaw_rate[mask] = yaw_rates[mask]
+        
+        # Append to state [x, y, z, yaw, collision_yaw_rate]
+        # state is [N, 4]
+        self.state = np.hstack([state, collision_yaw_rate[:, None]]) # [N, 5]
 
         # [N - 1, 4, 4]
         T_b0__b_curr = T_b0_b[:-1]
@@ -341,9 +363,9 @@ class VLN_N1_V2_Trajectories(Trajectories):
         # The drone's pose in the first frame of the trajectory.
         "observation.state": {
             "dtype": "float32",
-            "shape": (4,),
+            "shape": (5,),
             "names": {
-                "axes": ["x", "y", "z", "yaw"],
+                "axes": ["x", "y", "z", "yaw", "collision_avoidance_yaw_rate"],
             },
         },
         # The primary video feed from the drone's ego-centric camera.
@@ -386,15 +408,16 @@ class VLN_N1_V2_Trajectories(Trajectories):
                 for chunk_dir in data_dir.glob("chunk-*"):
                     if chunk_dir.is_dir():
                         self.parquet_files.extend(sorted(list(chunk_dir.glob("*.parquet"))))
-        
-        self.parquet_files.sort()
+
         print(f"Found {len(self.parquet_files)} trajectories.")
         
     def __len__(self) -> int:
         return len(self.parquet_files)
 
     def __iter__(self) -> Iterable[Traj]:
-        metadata_cache = {}
+        current_scene_dir = None
+        current_tasks_map = {}
+        current_esdf = None
 
         for parquet_path in self.parquet_files:
             try:
@@ -417,13 +440,25 @@ class VLN_N1_V2_Trajectories(Trajectories):
                 depth_dir = video_dir / "observation.images.depth"
                 pcd_path = scene_dir / "meta" / "pointcloud.ply"
                 
-                if not (rgb_dir.exists() and depth_dir.exists() and pcd_path.exists()):
+                if not (rgb_dir.exists() and depth_dir.exists()):
                     continue
 
-                # Load Metadata
-                scene_key = str(scene_dir)
-                if scene_key not in metadata_cache:
-                    tasks_map = {}
+                # Update resources if scene changed
+                if scene_dir != current_scene_dir:
+                    current_scene_dir = scene_dir
+                    
+                    # 1. Update ESDF
+                    if current_esdf is not None:
+                        del current_esdf
+                        import torch 
+                        torch.cuda.empty_cache()
+                    
+                    # Assume pcd exists
+                    pcd = o3d.io.read_point_cloud(str(pcd_path))
+                    current_esdf = PointCloudESDF(pcd, device="cuda:0")
+
+                    # 2. Update Metadata
+                    current_tasks_map = {}
                     episodes_file = scene_dir / "meta" / "episodes.jsonl"
                     if episodes_file.exists():
                         with open(episodes_file, "r") as f:
@@ -431,13 +466,12 @@ class VLN_N1_V2_Trajectories(Trajectories):
                                 try:
                                     item = json.loads(line)
                                     if "episode_index" in item:
-                                        tasks_map[item["episode_index"]] = item.get("tasks", [])
+                                        current_tasks_map[item["episode_index"]] = item.get("tasks", [])
                                 except:
                                     continue
-                    metadata_cache[scene_key] = tasks_map
                 
                 # Instruction Selection
-                tasks = metadata_cache[scene_key].get(episode_idx, [])
+                tasks = current_tasks_map.get(episode_idx, [])
                 instruction = ""
                 
                 if not validate_tasks(tasks):
@@ -460,7 +494,7 @@ class VLN_N1_V2_Trajectories(Trajectories):
                 
                 yield VLN_N1_V2_Traj(
                     parquet_path=parquet_path,
-                    pcd_path=pcd_path,
+                    esdf=current_esdf,
                     images=rgb_images,
                     depth_images=depth_images,
                     task=instruction,
@@ -490,8 +524,68 @@ class VLN_N1_V2_Trajectories(Trajectories):
 
 
 if __name__ == "__main__":
-    traj = VLN_N1_V2_Traj(Path("/data-10T/InternData-N1/3dfront_d435i/0a7770c3-fc94-42a5-a955-474b9b471ab0__3353a4f7f7/0a7770c3-fc94-42a5-a955-474b9b471ab0/data/chunk-000/episode_000000.parquet"), None, [], "", 0)
-
-    print(traj.T_b_c)
-    print(traj.K)
+    import matplotlib.pyplot as plt
+    
+    # Path to the generated data
+    data_root = Path("VLN-N1-test_data")
+    output_dir = Path("test/vln_n1_visual")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Scanning {data_root} for parquet files...")
+    parquet_files = sorted(list(data_root.rglob("episode_*.parquet")))
+    
+    if not parquet_files:
+        print(f"No parquet files found in {data_root}")
+    else:
+        for p_file in parquet_files:
+            try:
+                print(f"Processing {p_file.name}...")
+                df = pd.read_parquet(p_file)
+                
+                # Stack the state column: [N, 5] -> x, y, z, yaw, collision_yaw_rate
+                states = np.vstack(df["observation.state"].to_numpy())
+                
+                x = states[:, 0]
+                y = states[:, 1]
+                yaw_deg = states[:, 3]
+                coll_rate = states[:, 4]
+                
+                # Convert yaw to radians for plotting arrows
+                yaw_rad = np.deg2rad(yaw_deg)
+                
+                plt.figure(figsize=(10, 8))
+                
+                # Scatter plot colored by collision avoidance yaw rate (Magnitude)
+                # Using absolute value to visually emphasize intensity of avoidance
+                # Use a diverging map or just magnitude? 
+                # User asked for "depth/shallow" (深浅), usually implies magnitude.
+                sc = plt.scatter(x, y, c=np.abs(coll_rate), cmap='plasma', s=20, label='Avoidance Rate (Abs)')
+                cb = plt.colorbar(sc)
+                cb.set_label('Collision Yaw Rate Magnitude (deg/s)')
+                
+                # Plot Yaw direction with arrows
+                # Downsample for clarity
+                step = max(1, len(x) // 30)
+                plt.quiver(x[::step], y[::step], np.cos(yaw_rad[::step]), np.sin(yaw_rad[::step]), 
+                          color='black', alpha=0.6, scale=20, width=0.003, label='Yaw')
+                
+                # Start and End
+                plt.plot(x[0], y[0], 'g^', markersize=10, label='Start')
+                plt.plot(x[-1], y[-1], 'r*', markersize=10, label='End')
+                
+                plt.title(f"Trajectory: {p_file.stem}\nColored by Collision Avoidance Yaw Rate")
+                plt.xlabel("X (m)")
+                plt.ylabel("Y (m)")
+                plt.axis('equal')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                
+                out_path = output_dir / f"{p_file.stem}.png"
+                plt.savefig(out_path)
+                plt.close()
+                print(f"Saved visualization to {out_path}")
+                
+            except Exception as e:
+                print(f"Failed to plot {p_file}: {e}")
+                traceback.print_exc()
 

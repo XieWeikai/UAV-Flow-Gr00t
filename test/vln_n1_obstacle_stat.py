@@ -19,10 +19,24 @@ from utils.obstacle import compute_collision_prob, compute_yaw_rate
 # SEARCH_DIR =  "/data-10T/InternData-N1/3dfront_d435i" # "/data-10T/InternData-N1/hm3d_d435i"
 # SEARCH_DIR = "/data-10T/InternData-N1/hm3d_zed/00024-XNoaAZwsWKk__3ba4ce86c1/00024-XNoaAZwsWKk"
 # SEARCH_DIR = "/data-10T/InternData-N1/hm3d_zed/00003-NtVbfPCkBFy__93366f7175/00003-NtVbfPCkBFy"
-SEARCH_DIR = "/data-10T/InternData-N1/3dfront_d435i/0e563bef-ab48-4a9a-94c1-3018575fa499__999a5d0e93"
+# SEARCH_DIR = "/data-10T/InternData-N1/3dfront_d435i/0e563bef-ab48-4a9a-94c1-3018575fa499__999a5d0e93"
+SEARCH_DIR = [
+    "/data-10T/InternData-N1/3dfront_d435i",
+    "/data-10T/InternData-N1/3dfront_zed",
+    "/data-10T/InternData-N1/hm3d_d435i",
+    "/data-10T/InternData-N1/hm3d_zed",
+    "/data-10T/InternData-N1/replica_d435i",
+    "/data-10T/InternData-N1/replica_zed",
+    "/data-10T/InternData-N1/hssd_d435i",
+    "/data-10T/InternData-N1/hssd_zed",
+    "/data-10T/InternData-N1/matterport3d_d435i",
+    "/data-10T/InternData-N1/matterport3d_zed",
+    "/data-10T/InternData-N1/gibson_d435i",
+    "/data-10T/InternData-N1/gibson_zed",
+]
 
 # 采样轨迹数量 (N)
-N_SAMPLES = 500
+N_SAMPLES = 3000
 
 # 平滑窗口大小 (SMOOTH_WINDOW)
 SMOOTH_WINDOW = 10
@@ -37,8 +51,8 @@ YAW_RATE_PERCENTILE = 0.25
 VIS_YAW_RATE_THRESHOLD = 18.96 # deg/s
 
 # 运行模式 (MODE): "STAT" or "VIS"
-# MODE = "STAT"
-MODE = "VIS"
+MODE = "STAT"
+# MODE = "VIS"
 
 # 输出目录
 OUTPUT_DIR = Path("test/obstacle_stat_output")

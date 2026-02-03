@@ -20,5 +20,7 @@ UAVFlow*/
 VLN*/
 test_*/
 
-test/vln_ce_visual*
+test/*_visual*
+test/obstacle*
 debug**/*
+**/*.log

@@ -2,18 +2,27 @@
 set -o pipefail  # Ensure pipeline errors are caught
 
 # Configuration
-OUTPUT_DIR="/data-10T/InternData-N1"
-NUM_PROCESSES=16
+OUTPUT_DIR="/data-25T/InternData-N1/exp"
+NUM_PROCESSES=8
 MAX_LOG_LINES=2000
-EXTRA_ARGS=""
+EXTRA_ARGS="--roll_limit 40.0"
 
 # Directories to process
 # Format: "Path"
 # The script uses the directory name (basename) as the task ID.
 RAW_DIRS=(
-    "/data-10T/InternData-N1/r2r"
-    "/data-10T/InternData-N1/rxr"
-    "/data-10T/InternData-N1/scalevln"
+    /data-25T/InternData-N1/hm3d_d435i
+    /data-25T/InternData-N1/hm3d_zed
+    /data-10T/InternData-N1/3dfront_d435i
+    /data-10T/InternData-N1/3dfront_zed
+    /data-10T/InternData-N1/gibson_d435i
+    /data-10T/InternData-N1/gibson_zed
+    /data-10T/InternData-N1/hssd_d435i
+    /data-10T/InternData-N1/hssd_zed
+    /data-10T/InternData-N1/matterport3d_d435i
+    /data-10T/InternData-N1/matterport3d_zed
+    /data-10T/InternData-N1/replica_d435i
+    /data-10T/InternData-N1/replica_zed
 )
 
 # -----------------------------------------------------------------------------
@@ -61,45 +70,12 @@ try:
                     fw.flush() # Ensure update is visible
                 
                 # Re-open in append mode for next loop
-                # Note: 'f' is still open but pointing to old file handle technically, 
-                # but since we are in a loop with 'with open', we need to be careful.
-                # Actually, rewriting the file underneath an open file handle 'f' 
-                # might cause issues on some OS, but on Linux 'w' creates a new inode 
-                # or truncates. Let's close and reopen properly conceptually, 
-                # but inside this loop 'f' is fixed.
-                
-                # Better approach for the loop:
                 current_lines = len(new_content)
 
-    # To fix the file handle issue above, we can't easily swap 'f' inside the loop.
-    # Simpler logic for correctness:
 except BrokenPipeError:
     pass
 " 
-    # Fallback to a simpler but slower approach if the above is too complex to inline reliably:
-    # Pure Python Re-writer (Writes every line)
-    # This is IO heavy but 100% correct and simpler to inline.
-    python3 -u -c "
-import sys
-from collections import deque
-
-log_file = '$log_file'
-max_lines = $max_lines
-q = deque(maxlen=max_lines)
-
-# Initialize
-with open(log_file, 'w') as f: pass
-
-try:
-    for line in sys.stdin:
-        q.append(line)
-        # Optimization: batch write every 10 lines or just write every line
-        # Writing every line ensures 'tail -f' works roughly well
-        with open(log_file, 'w') as f:
-            f.writelines(q)
-except (BrokenPipeError, KeyboardInterrupt):
-    pass
-"
+    # Fallback/Safety (if complex python script fails, could use simpler version, but this catches exceptions)
 }
 
 # Use the cleaner optimization logic in a function
@@ -154,15 +130,6 @@ except (BrokenPipeError, KeyboardInterrupt):
 }
 
 
-# Directories to process
-# Format: "Path"
-# The script uses the directory name (basename) as the task ID.
-RAW_DIRS=(
-    "/data-10T/InternData-N1/r2r"
-    "/data-10T/InternData-N1/rxr"
-    "/data-10T/InternData-N1/scalevln"
-)
-
 # -----------------------------------------------------------------------------
 # Helper function to print usage
 usage() {
@@ -178,8 +145,7 @@ usage() {
     echo ""
     echo "Example:"
     echo "  $0                # Run all tasks"
-    echo "  $0 r2r            # Run only the 'r2r' task"
-    echo "  $0 r2r scalevln   # Run 'r2r' and 'scalevln'"
+    echo "  $0 task1          # Run only the 'task1' task"
 }
 
 # Check for help flag
@@ -213,6 +179,11 @@ else
     done
 fi
 
+if [ ${#TARGET_DIRS[@]} -eq 0 ]; then
+    echo "No directories configured to process. Please edit the configuration section."
+    exit 1
+fi
+
 echo "Starting execution for: $(for d in "${TARGET_DIRS[@]}"; do basename "$d"; done)"
 
 # Create a logs directory
@@ -227,7 +198,7 @@ for dir in "${TARGET_DIRS[@]}"; do
     echo "[$NAME] Running... (Log: $LOG_FILE, Max Lines: $MAX_LOG_LINES)"
     
     # Run using the wrapper function for log limiting
-    run_with_log_limit "uv run vln_ce.py --raw_dir '$dir' --output_dir '$OUTPUT_DIR' --num_processes '$NUM_PROCESSES' $EXTRA_ARGS" "$LOG_FILE" &
+    run_with_log_limit "uv run vln_n1_v2.py --raw_dir '$dir' --output_dir '$OUTPUT_DIR' --num_processes '$NUM_PROCESSES' $EXTRA_ARGS" "$LOG_FILE" &
     
     PID=$!
     PIDS+=($PID)
@@ -257,4 +228,3 @@ if [ $FAILED -ne 0 ]; then
 else
     echo "All tasks finished successfully."
 fi
-

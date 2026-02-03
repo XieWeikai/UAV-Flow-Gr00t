@@ -73,6 +73,7 @@ parser.add_argument("--codec", type=str, default="h264", choices=["h264", "hevc"
 parser.add_argument("--num_threads", type=int, default=4, help="Number of threads for image writing")
 parser.add_argument("--num_processes", type=int, default=0, help="Number of processes for image writing")
 parser.add_argument("--batch_size", type=int, default=50, help="Batch size for video encoding")
+parser.add_argument("--roll_limit", type=float, default=5.0, help="Roll limit for filtering trajectories")
 args = parser.parse_args()
 
 use_encoding(args.codec)
@@ -86,6 +87,7 @@ def port(
     num_threads: int,
     num_processes: int,
     batch_size: int,
+    roll_limit: float = 5.0,
     *args, **kwargs
 ):
     """Port raw dataset to LeRobotDataset format."""
@@ -111,7 +113,8 @@ def port(
             batch_encoding_size=batch_size,
         )
     
-    trajectories = traj_cls(raw_dir, get_task_idx=partial(get_task_idx, lerobot_dataset), features=features)
+    filter_condition = {"roll_limit": roll_limit}
+    trajectories = traj_cls(raw_dir, get_task_idx=partial(get_task_idx, lerobot_dataset), features=features, filter_condition=filter_condition)
 
     start_time = time.time()
     num_episodes = len(trajectories)
@@ -192,6 +195,7 @@ def main():
         num_threads=args.num_threads,
         num_processes=args.num_processes,
         batch_size=args.batch_size,
+        roll_limit=args.roll_limit,
     )
     
     validate_dataset(f"VLN-N1-{folder_name}", root=root)

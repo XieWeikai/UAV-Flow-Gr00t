@@ -1,7 +1,7 @@
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-from typing import Iterable
+from typing import Iterable, Union
 import pathlib
 import copy
 
@@ -349,6 +349,133 @@ def body_to_world_pose(p1: np.ndarray, p2: np.ndarray, degree: bool = False) -> 
 
     # return in [x, y, z, roll, pitch, yaw] order
     return np.concatenate([world_pos, world_euler[::-1]])
+
+def get_poses(T: np.ndarray) -> np.ndarray:
+    """
+    Get poses in [x, y, z, yaw] format.
+    Args:
+        T: [N, 4, 4]
+    Returns:
+        poses: [N, 4]
+    """
+    # Yaw extraction (ZYX euler)
+    Rot = T[:, :3, :3]
+    yaw, pitch, roll = R.from_matrix(Rot).as_euler('ZYX', degrees=True).T # assumes pitch and roll are small ≈0
+    pos = T[:, :3, 3]
+    return np.concatenate([pos, yaw[:, None]], axis=1).astype(np.float32)
+
+
+import open3d as o3d
+
+class PointCloudESDF:
+    """
+    Fast unsigned ESDF approximation using nearest-neighbor distance
+    on point clouds.
+    """
+
+    def __init__(
+        self,
+        ply_or_pcd: Union[str, o3d.geometry.PointCloud],
+        voxel_size: float = 0.01,
+        device: str = "CPU",
+        pre_filter = None
+    ):
+        self.voxel_size = voxel_size
+        self.device = o3d.core.Device(device)
+        self.pre_filter = pre_filter
+
+        self._load_point_cloud(ply_or_pcd)
+        self._build_index()
+
+    # ------------------------------------------------------------
+    def _load_point_cloud(self, source: Union[str, o3d.geometry.PointCloud]):
+        if isinstance(source, str):
+            pcd = o3d.io.read_point_cloud(source)
+        elif isinstance(source, o3d.geometry.PointCloud):
+            pcd = source
+        else:
+            raise ValueError("Input must be a file path (str) or o3d.geometry.PointCloud")
+
+        if len(pcd.points) == 0:
+            raise ValueError("Point cloud is empty")
+        
+        if self.pre_filter is not None:
+            points = np.asarray(pcd.points)
+            mask = self.pre_filter(points)
+            if np.any(mask): 
+                pcd = pcd.select_by_index(np.where(mask)[0])
+            else:
+                # If all points filtered out, we might have an issue or empty pcd
+                # But creating empty tensor later might work or crash.
+                # Let's assume select_by_index handles empty list gracefully or results in empty pcd.
+                pcd = o3d.geometry.PointCloud()
+
+        if self.voxel_size is not None and len(pcd.points) > 0:
+            pcd = pcd.voxel_down_sample(self.voxel_size)
+
+        self.points_np = np.asarray(pcd.points, dtype=np.float32)
+        if len(self.points_np) == 0:
+             # If empty after filtering
+             # Create a dummy point far away to avoid crashing knn search or handle it?
+             # For now, let's allow empty and rely on user knowing what they filter.
+             # But KNN search usually requires at least one point.
+             # We can warn.
+             src_str = source if isinstance(source, str) else "InMemoryPointCloud"
+             print(f"Warning: Point cloud empty after filtering/loading: {src_str}")
+             
+        self.points = o3d.core.Tensor(self.points_np, device=self.device)
+
+    # ------------------------------------------------------------
+    def _build_index(self):
+        self.nns = o3d.core.nns.NearestNeighborSearch(self.points)
+        self.nns.knn_index()
+
+    # ------------------------------------------------------------
+    def query(
+        self,
+        query_points: np.ndarray,
+        k: int = 1
+    ):
+        """
+        Query nearest points and distances.
+
+        Args:
+            query_points: (N, 3) numpy array
+            k: number of nearest neighbors (default=1)
+
+        Returns:
+            coords: (N, k, 3) numpy array
+            dists:  (N, k) numpy array
+        """
+        if query_points.ndim != 2 or query_points.shape[1] != 3:
+            raise ValueError("query_points must have shape (N, 3)")
+        if k < 1:
+            raise ValueError("k must be >= 1")
+
+        query = o3d.core.Tensor(
+            query_points.astype(np.float32),
+            device=self.device
+        )
+
+        idx, dist2 = self.nns.knn_search(query, k)
+
+        # to numpy
+        idx = idx.cpu().numpy()              # (N, k)
+        dists = dist2.sqrt().cpu().numpy()   # (N, k)
+
+        # gather coordinates
+        coords = self.points_np[idx]         # (N, k, 3)
+
+        return coords, dists
+
+    # ------------------------------------------------------------
+    def info(self):
+        return {
+            "num_points": int(self.points.shape[0]),
+            "voxel_size": self.voxel_size,
+            "device": str(self.device)
+        }
+
 
 
 def random_pose(degree: bool = False) -> np.ndarray:

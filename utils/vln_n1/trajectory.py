@@ -262,7 +262,7 @@ class Ignore(Exception):
 
 class VLN_N1_Traj(Traj):
     
-    def __init__(self, frames: dict, get_task_idx: Callable[[str], int], image_size: tuple[int, int] = (256, 256)):
+    def __init__(self, frames: dict, get_task_idx: Callable[[str], int], image_size: tuple[int, int] = (256, 256), filter_condition: dict = None):
         self.frames = frames
         self.image_size = image_size
         self.df = pd.read_parquet(frames["parquet_path"])
@@ -273,8 +273,12 @@ class VLN_N1_Traj(Traj):
         T_w_c = self._get_action(0)
 
         _, _, roll = self.get_euler(T_w_c)
-        if abs(90.0 - roll) > 5.0:
-            raise Ignore(f"Unexpected roll angle: {roll}°. Expected 85~95°.")
+        roll_limit = 5.0
+        if filter_condition and "roll_limit" in filter_condition:
+            roll_limit = filter_condition["roll_limit"]
+
+        if abs(90.0 - roll) > roll_limit:
+            raise Ignore(f"Unexpected roll angle: {roll}°. Expected {90.0 - roll_limit}~{90.0 + roll_limit}°.")
 
         # camera coordinate after rolling z (-z is camera forward direction) to horizontal
         T_w_c_horizontal = self.roll_to_horizontal(T_w_c)
@@ -692,9 +696,10 @@ class VLN_N1_Trajectories(Trajectories):
             
         return features
 
-    def __init__(self, data_path: str, get_task_idx: Callable[[str], int], features: dict = None):
+    def __init__(self, data_path: str, get_task_idx: Callable[[str], int], features: dict = None, filter_condition: dict = None):
         self.data_path = Path(data_path)
         self.processor = InternDataProcessor(data_path)
+        self.filter_condition = filter_condition
         
         # Use provided features or detect them
         if features is None:
@@ -761,7 +766,7 @@ class VLN_N1_Trajectories(Trajectories):
                     previous_id = None
                 
                 try:
-                    traj = VLN_N1_Traj(frames, self.get_task_idx, image_size=self.image_size)
+                    traj = VLN_N1_Traj(frames, self.get_task_idx, image_size=self.image_size, filter_condition=self.filter_condition)
                     yield traj
                     # If yield returns, it means the consumer has accepted the trajectory
                     # We set previous_id to mark it as done on the NEXT iteration

@@ -1,0 +1,1 @@
+from utils.vln_n1_v2.trajectory import VLN_N1_V2_Traj, VLN_N1_V2_Trajectories

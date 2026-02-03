@@ -205,9 +205,17 @@ class VideoFrame:
     def __call__(self):
         return self.pa_type
 
-with warnings.catch_warnings():
-    warnings.filterwarnings("ignore", category=UserWarning)
-    register_feature(VideoFrame, "VideoFrame")
+# Suppress "Overwriting feature type" log from datasets
+_datasets_log = logging.getLogger("datasets")
+_prev_level = _datasets_log.level
+_datasets_log.setLevel(logging.ERROR)
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        register_feature(VideoFrame, "VideoFrame")
+finally:
+    # Restore original logging level
+    _datasets_log.setLevel(_prev_level)
 
 def get_video_info(video_path: Path | str) -> dict:
     logging.getLogger("libav").setLevel(av.logging.ERROR)

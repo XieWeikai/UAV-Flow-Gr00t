@@ -1,67 +1,16 @@
 import logging
-import warnings
-import os
-from datetime import datetime
-from logging.handlers import RotatingFileHandler
-from argparse import ArgumentParser
-from pathlib import Path
-
-# 0. Pre-parse raw_dir for log filename
-temp_parser = ArgumentParser(add_help=False)
-temp_parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo")
-known_args, _ = temp_parser.parse_known_args()
-raw_dir_name = Path(known_args.raw_dir).name
-# Clean up the name for filename safety
-raw_dir_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in raw_dir_name)
-
-# 1. root logger：最低 INFO
-root = logging.getLogger()
-root.setLevel(logging.INFO)
-
-# 2. 控制台 handler（INFO+）
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter(
-    "%(asctime)s %(levelname)s %(message)s"
-)
-console_handler.setFormatter(console_formatter)
-
-# 3. 文件 handler（WARNING+）
-# 使用包含时间戳和 PID 的独立日志文件名，避免多进程冲突
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-pid = os.getpid()
-log_filename = f"warnings_{raw_dir_name}_{timestamp}_{pid}.log"
-
-file_handler = RotatingFileHandler(
-    log_filename,
-    maxBytes=50 * 1024 * 1024,
-    backupCount=5,
-    encoding="utf-8",   # 强烈建议
-)
-file_handler.setLevel(logging.WARNING)
-file_formatter = logging.Formatter(
-    "%(asctime)s %(levelname)s %(message)s"
-)
-file_handler.setFormatter(file_formatter)
-
-# 4. 挂 handler（避免重复挂）
-root.handlers.clear()
-root.addHandler(console_handler)
-root.addHandler(file_handler)
-
-# 5. 捕获 warnings.warn
-logging.captureWarnings(True)
-
 import time
 import json
 from pathlib import Path
-
+from argparse import ArgumentParser
 
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from utils.lerobot.lerobot_creater import LeRobotCreator
 from utils import Trajectories
-from utils.vln_n1 import VLN_N1_Trajectories
-from argparse import ArgumentParser
+from utils.vln_n1_v2.trajectory import VLN_N1_V2_Trajectories, VLN_N1_V2_Traj, Ignore
+
+# Setup basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 parser = ArgumentParser(description="Port VLN-N1 dataset to LeRobotDataset format")
 parser.add_argument("--raw_dir", type=str, default="InternData-n1-demo", help="Path to the raw VLN-N1 dataset directory")
@@ -85,8 +34,7 @@ def port(
     """Port raw dataset to LeRobotDataset format."""
     logging.info(f"Porting raw dataset from {raw_dir} to LeRobotDataset repo {repo_id}")
     
-    # Determine features dynamically
-    features = traj_cls.get_features(raw_dir)
+    features = traj_cls.FEATURES
 
     logging.info(f"Creating LeRobotCreator at {root}")
     creator = LeRobotCreator(
@@ -102,9 +50,14 @@ def port(
     
     def get_task_idx(task: str) -> int:
         return creator.add_task(task)
-
-    filter_condition = {"roll_limit": roll_limit}
-    trajectories = traj_cls(raw_dir, get_task_idx=get_task_idx, features=features, filter_condition=filter_condition)
+    
+    def roll_filter(self: VLN_N1_V2_Traj):
+        if abs(90.0 - self.ori_roll) > roll_limit:
+            raise Ignore(f"Unexpected roll angle: {self.ori_roll}°. Expected {90.0 - roll_limit}~{90.0 + roll_limit}°.")
+        
+    
+    VLN_N1_V2_Traj.set_filter(roll_filter)
+    trajectories = traj_cls(raw_dir, get_task_idx=get_task_idx)
 
     start_time = time.time()
     num_episodes = len(trajectories)
@@ -115,7 +68,7 @@ def port(
         
         elapsed_time = time.time() - start_time
         if (episode_index + 1) % 10 == 0:
-            logging.info(f"Submitted {episode_index + 1} / {num_episodes} episodes (elapsed {elapsed_time:.3f} s)")
+            logging.info('\033[92m' + f"Submitted {episode_index + 1} / {num_episodes} episodes (elapsed {elapsed_time:.3f} s)" + '\033[0m')
 
     logging.info("All episodes submitted. Waiting for completion...")
     creator.wait()
@@ -148,10 +101,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     root = output_dir / f"VLN-N1-{folder_name}"
     port(
-        raw_dir=raw_dir,
+        raw_dir=str(raw_dir),
         repo_id=f"VLN-N1-{folder_name}",
-        root=root,
-        traj_cls=VLN_N1_Trajectories,
+        root=str(root),
+        traj_cls=VLN_N1_V2_Trajectories,
         num_processes=args.num_processes,
         codec=args.codec,
         roll_limit=args.roll_limit,
@@ -161,4 +114,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

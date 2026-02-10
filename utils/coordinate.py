@@ -377,7 +377,7 @@ class PointCloudESDF:
         self,
         ply_or_pcd: Union[str, o3d.geometry.PointCloud],
         voxel_size: float = 0.01,
-        device: str = "CPU",
+        device: str = "CPU:0",
         pre_filter = None
     ):
         self.voxel_size = voxel_size

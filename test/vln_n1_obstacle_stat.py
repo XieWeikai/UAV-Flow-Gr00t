@@ -314,6 +314,37 @@ def run_analysis():
             # 也可以计算前 25% 的平均值
             top_block = arr[arr >= threshold_val]
             print(f"  Mean of Top {YAW_RATE_PERCENTILE*100}%: {np.mean(top_block):.2f}")
+
+            # Plot Probability Density Distribution
+            try:
+                plt.figure(figsize=(10, 6))
+                
+                # Histogram (Density)
+                n, bins, patches = plt.hist(arr, bins=50, density=True, alpha=0.6, color='b', label='Histogram')
+                
+                # KDE (Kernel Density Estimation)
+                from scipy.stats import gaussian_kde
+                kde = gaussian_kde(arr)
+                x_grid = np.linspace(arr.min(), arr.max(), 500)
+                plt.plot(x_grid, kde(x_grid), 'r-', linewidth=2, label='KDE')
+                
+                # Vertical lines for stats
+                plt.axvline(mean_val, color='k', linestyle='dashed', linewidth=1, label=f'Mean: {mean_val:.2f}')
+                plt.axvline(threshold_val, color='g', linestyle='dashed', linewidth=1, label=f'Top {YAW_RATE_PERCENTILE*100}%: {threshold_val:.2f}')
+                
+                plt.title(f"Yaw Rate Distribution for Risk > {COLLISION_THRESHOLD}\n(N={total_high_risk_points})")
+                plt.xlabel("Yaw Rate (deg/s)")
+                plt.ylabel("Probability Density")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                
+                dist_path = OUTPUT_DIR / "high_risk_yaw_rates_dist.png"
+                plt.savefig(dist_path)
+                plt.close()
+                print(f"Saved yaw rate distribution plot to: {dist_path}")
+                
+            except Exception as e:
+                print(f"Failed to plot distribution: {e}")
             
         else:
             print("No high risk points found.")

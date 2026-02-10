@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import json
 from tqdm import tqdm
-from typing import Callable, Iterable, Optional, Tuple, List, Dict
+from typing import Callable, Iterable, Optional, Tuple, List, Dict, Any
 import traceback
 from pathlib import Path
 import pandas as pd
@@ -16,47 +16,45 @@ from scipy.spatial.transform import Rotation
 from utils.coordinate import homogeneous_inv, get_poses, PointCloudESDF
 from utils.obstacle import compute_collision_prob, compute_yaw_rate
 
-def validate_tasks(tasks: List[Dict]) -> bool:
-    instructions = tasks
+def _is_valid_index_pair(x: Any) -> bool:
+    if not isinstance(x, (list, tuple)) or len(x) != 2:
+        return False
+    a, b = x[0], x[1]
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return a <= b
 
-    try:
-        sum_instruction = None
-        for i, ins in enumerate(instructions):
-            if "sum_instruction" in ins:
-                item = instructions.pop(i)
-                sum_instruction = item["sum_instruction"]
-                break
-        
-        selected_instruction = ""
-        # 10% chance to select sum_instruction
-        if sum_instruction is not None and np.random.rand() < 0.1:
-            selected_instruction = sum_instruction
-        else:
-            found = False
-            for ins in instructions:
-                if ins["sub_indexes"][0] <= 1000 <= ins["sub_indexes"][1]:
-                    if np.random.rand() < 0.5:
-                        selected_instruction = ins["sub_instruction"]
-                    else:
-                        selected_instruction = ins["revised_sub_instruction"]
-                    found = True
-                    break
-            if not found:
-                if sum_instruction is not None:
-                    selected_instruction = sum_instruction
-                elif len(instructions) > 0:
-                    selected_instruction = instructions[-1]["sub_instruction"]
-                else:
-                    # Fallback failed
-                    logging.warning("validate_tasks: No instruction found and no fallback available.")
-                    return False
-                    
-    except Exception as e:
-        traceback.print_exc()
-        logging.warning(f"Error validating tasks: {e}")
+def _is_nonempty_str(x: Any) -> bool:
+    return isinstance(x, str) and len(x.strip()) > 0
+
+def validate_tasks(tasks: List[Dict[str, Any]]) -> bool:
+    """
+    Returns True iff tasks contains at least one valid item of either:
+      1) sub item: {"sub_instruction": str, "revised_sub_instruction": str, "sub_indexes": [a,b]}
+      2) sum item: {"sum_instruction": str, "sum_indexes": [a,b]}
+    """
+    if not isinstance(tasks, list) or len(tasks) == 0:
         return False
 
-    return True
+    for ins in tasks:
+        if not isinstance(ins, dict):
+            continue
+
+        # Case 1: sub item
+        if (
+            (_is_nonempty_str(ins.get("sub_instruction")) or _is_nonempty_str(ins.get("revised_sub_instruction")) )
+            and
+            _is_valid_index_pair(ins.get("sub_indexes"))
+        ):
+            return True
+
+        # Case 2: sum item
+        if (
+            _is_nonempty_str(ins.get("sum_instruction")) and
+            _is_valid_index_pair(ins.get("sum_indexes"))
+        ):
+            return True
+    return False
 
 
 class Ignore(Exception):
@@ -91,7 +89,7 @@ class VLN_N1_V2_Traj(Traj):
         self.T_b_c, self.T_c_b, self.ori_roll = VLN_N1_V2_Traj._compute_T_b_c_and_T_c_b(T_w_c)
 
         # pointcloud
-        self.esdf = esdf
+        # self.esdf = esdf # Do not store ESDF to avoid IPC issues
 
         # images and other data
         self.images = images
@@ -104,28 +102,32 @@ class VLN_N1_V2_Traj(Traj):
         self.task_idx = task_idx
         assert len(self.df) == len(self.images), "Number of images and frames must match."
 
+        # Parse tasks and extract sub_indexes
+        try:
+            tasks_list = json.loads(self.task)
+            self.sub_indexes = []
+            for t in tasks_list:
+                if "sub_indexes" in t:
+                    self.sub_indexes.append(t["sub_indexes"])
+                if "sum_indexes" in t:
+                    self.sub_indexes.append(t["sum_indexes"])
+            # sort by end index
+            self.sub_indexes.sort(key=lambda x: x[1])
+        except Exception as e:
+            # Fallback if parsing fails or structure is different
+            print(f"Warning: Failed to parse tasks or extract sub_indexes in V2 trajectory: {e}")
+            self.sub_indexes = []
+
         if VLN_N1_V2_Traj._filter is not None:
             VLN_N1_V2_Traj._filter(self)
         
-        # preprocessing all data
-        self.process_traj()
-
-    def __getstate__(self):
-        # Only preserve attributes needed for __iter__ and metadata
-        return {
-            "df": self.df,
-            "images": self.images,
-            "task": self.task,
-            "task_idx": self.task_idx,
-            "state": self.state,
-            "actions": self.actions,
-            "T_b_c": self.T_b_c,
-            "K": self.K,
-        }
+        # preprocessing collision (requires ESDF)
+        self._precompute_collision(esdf)
 
 
     def __len__(self)-> int:
         return len(self.df)
+    
     
     @staticmethod
     def load_depth(depth_path: str) -> np.ndarray:
@@ -136,90 +138,105 @@ class VLN_N1_V2_Traj(Traj):
             depth = depth[:, :, 0]
         return depth.astype(np.float32) * 0.0001
     
-    def find_farthest_visible_frame_vectorized(self, current_idx: int, min_depth_map: np.ndarray, T_w_c_all: np.ndarray) -> tuple[int, np.ndarray]:
-        """
-        Vectorized implementation of searching for the farthest visible frame.
-        """
+    def find_farthest_visible_frame_vectorized(self, current_idx: int, min_depth_map: np.ndarray, T_w_c_all: np.ndarray, search_end: int) -> tuple[int, np.ndarray]:
         N = len(T_w_c_all)
-        if current_idx >= N - 1:
+        # boundary check: if current_idx is already at or beyond search_end, return current_idx as the farthest visible frame (no movement)
+        if current_idx >= N - 1 or search_end <= current_idx:
             return current_idx, T_w_c_all[current_idx]
 
-        # 1. Lookahead Candidates
-        # Determine search end strictly. V1 used sub_indexes tasks logic.
-        # Here we assume we can look up to the end of the trajectory.
-        search_range = np.arange(current_idx + 1, N)
-        T_w_targets = T_w_c_all[search_range] # [M, 4, 4]
+        # 1. construct search range [current+1, search_end]
+        search_range = np.arange(current_idx + 1, search_end + 1)
+        T_w_targets = T_w_c_all[search_range] 
         
-        # 2. Transform to Current Camera Frame
+        # 2. projection calculation (keep formula exactly the same as V1)
         T_w_curr = T_w_c_all[current_idx]
         T_curr_w = homogeneous_inv(T_w_curr)
-        # (4,4) @ (M, 4, 4) -> (M, 4, 4)
         T_curr_targets = np.matmul(T_curr_w, T_w_targets)
         
-        # 3. Project to Image Plane
-        # Position in current camera frame: T[:3, 3]
-        P_c = T_curr_targets[:, :3, 3] # [M, 3] (X, Y, Z)
-        
-        # Camera Axes: +x right, +y up, +z backwards
-        # Depth d = -Z
-        X = P_c[:, 0]
-        Y = P_c[:, 1]
-        Z = P_c[:, 2]
-        
+        P_c = T_curr_targets[:, :3, 3]
+        X, Y, Z = P_c[:, 0], P_c[:, 1], P_c[:, 2]
         D = -Z 
         
-        # 4. Filter Invalid Points
-        # Min depth check
-        valid_mask = D > 0.1 
-        
-        # Project
         fx, fy = self.K[0, 0], self.K[1, 1]
         cx, cy = self.K[0, 2], self.K[1, 2]
         H, W = self.H, self.W
         
-        # Note: V1 project_camera_point logic:
-        # u = X * fx / depth + cx
-        # v = H - 1 - (Y * fy / depth + cy)
-        
         u = (X * fx / D) + cx
         v = (H - 1) - ((Y * fy / D) + cy)
-        
-        # Edge check
-        in_bounds = (u >= self.EDGE) & (u <= W - self.EDGE) & (v >= self.EDGE) & (v <= H - self.EDGE)
-        
-        valid_mask = valid_mask & in_bounds
-        
-        # Optimization: If no points are valid in bounds/depth, return current
-        if not np.any(valid_mask):
-            return current_idx, T_w_c_all[current_idx]
 
-        # 5. Visibility Check (Occlusion) using Min-Filter on Depth
-        # min_depth_map is passed in now to avoid recomputing it inside
+        # 3. find last visible index from start to end (stop at the first index that is either out of bounds or occluded)
+        #  A: out of bounds (must use float to exactly align with project_camera_point internal logic)
+        is_out = (u < 0.0) | (u >= float(W)) | (v < 0.0) | (v >= float(H)) | (D <= 0.0)
         
-        # Sample safe depth at projection points
-        u_int = np.clip(np.round(u), 0, W-1).astype(int)
-        v_int = np.clip(np.round(v), 0, H-1).astype(int)
+        #  B: occlusion (only calculate for points not out of bounds)
+        is_occ = np.zeros_like(is_out, dtype=bool)
+        can_check_occ = ~is_out
+        if np.any(can_check_occ):
+            u_round = np.round(u[can_check_occ]).astype(int)
+            v_round = np.round(v[can_check_occ]).astype(int)
+            # in case that rounding pushes (479.9 -> 480) us out of bounds, we clip to valid range (this mimics the behavior of project_camera_point which would also fail if out of bounds)
+            u_round = np.clip(u_round, 0, W - 1)
+            v_round = np.clip(v_round, 0, H - 1)
+            is_occ[can_check_occ] = (min_depth_map[v_round, u_round] <= D[can_check_occ])
+
         
-        measured_min_depths = min_depth_map[v_int, u_int]
+        stop_mask = is_out | is_occ
+        break_points = np.where(stop_mask)[0]
         
-        # Visibility Condition:
-        # If min_depth_in_patch <= projected_depth, then there is an obstacle closer (or equal) -> occluded.
-        # So we need min_depth_in_patch > projected_depth
-        # Allow small margin? V1 uses strict comparison.
-        is_visible = measured_min_depths > D # implicit margin if needed, or strict D
+        if len(break_points) > 0:
+            # If break occurs at index K, then the last successful frame is K-1
+            last_success_rel_idx = break_points[0] - 1
+            # Align with V1's initial value: visible_idx = current_idx + 1
+            # If even the first frame fails, last_success_rel_idx = -1, max then points to search_range[0]
+            visible_idx = search_range[max(0, last_success_rel_idx)]
+        else:
+            # All frames in the search range are visible
+            visible_idx = search_end
+
+        # 4. Simulate V1's second Backward Loop (handling edge fallback)
+        # Goal: In the range [current+1, visible_idx], find the highest non-edge frame
+        search_back_range = np.arange(current_idx + 1, visible_idx + 1)
+        rel_indices = search_back_range - (current_idx + 1)
         
-        final_mask = valid_mask & is_visible
+        u_back = u[rel_indices]
+        v_back = v[rel_indices]
         
-        # 6. Find Farthest
-        # Indices of 'search_range' that are true
-        valid_indices = search_range[final_mask]
+        # Condition C: Edge check (using float u, v)
+        is_near_edge = (u_back < float(self.EDGE)) | (u_back > float(W - self.EDGE)) | \
+                       (v_back < float(self.EDGE)) | (v_back > float(H - self.EDGE))
         
-        if len(valid_indices) == 0:
-            return current_idx, T_w_c_all[current_idx]
+        not_near_edge = ~is_near_edge
+        safe_indices = np.where(not_near_edge)[0]
         
-        farthest_idx = valid_indices.max()
-        return farthest_idx, T_w_c_all[farthest_idx]
+        if len(safe_indices) > 0:
+            # Take the last (highest) non-edge frame in the visible path
+            farthest_idx = search_back_range[safe_indices[-1]]
+        else:
+            # If all are at the edge, V1 loop will always return current_idx + 1
+            farthest_idx = current_idx + 1
+
+        return int(farthest_idx), T_w_c_all[farthest_idx]
     
+    def _precompute_collision(self, esdf: PointCloudESDF) -> None:
+        # camera->world [N, 4, 4]
+        T_w_c = np.vstack(self.df["action"].to_numpy()).reshape(-1, 4, 4)
+        T_w_b = T_w_c @ self.T_c_b
+        poses_world = get_poses(T_w_b)
+        
+        # 1. Collision Probability
+        probs = compute_collision_prob(poses_world, esdf, dt=self.DT)
+        
+        # 2. Yaw Rate (deg/s)
+        # Using body frame yaw or world frame yaw? compute_yaw_rate expects yaw series.
+        # poses_world[:, 3] is yaw in degrees.
+        yaw_rates = compute_yaw_rate(poses_world[:, 3], dt=self.DT, smoothing_window=self.SMOOTH_WINDOW)
+        
+        # 3. Filter
+        # If prob > threshold, use yaw_rate, else 0.0
+        self.collision_yaw_rate = np.zeros_like(yaw_rates)
+        mask = probs > self.COLLISION_THRESHOLD
+        self.collision_yaw_rate[mask] = yaw_rates[mask]
+
     def process_traj(self) -> None:
         # camera->world [N, 4, 4]
         T_w_c = np.vstack(self.df["action"].to_numpy()).reshape(-1, 4, 4)
@@ -236,25 +253,9 @@ class VLN_N1_V2_Traj(Traj):
         # each row: x, y, z (m), yaw (deg)
         state = get_poses(T_b0_b)
         
-        poses_world = get_poses(T_w_b)
-        
-        # 1. Collision Probability
-        probs = compute_collision_prob(poses_world, self.esdf, dt=self.DT)
-        
-        # 2. Yaw Rate (deg/s)
-        # Using body frame yaw or world frame yaw? compute_yaw_rate expects yaw series.
-        # poses_world[:, 3] is yaw in degrees.
-        yaw_rates = compute_yaw_rate(poses_world[:, 3], dt=self.DT, smoothing_window=self.SMOOTH_WINDOW)
-        
-        # 3. Filter
-        # If prob > threshold, use yaw_rate, else 0.0
-        collision_yaw_rate = np.zeros_like(yaw_rates)
-        mask = probs > self.COLLISION_THRESHOLD
-        collision_yaw_rate[mask] = yaw_rates[mask]
-        
         # Append to state [x, y, z, yaw, collision_yaw_rate]
         # state is [N, 4]
-        self.state = np.hstack([state, collision_yaw_rate[:, None]]) # [N, 5]
+        self.state = np.hstack([state, self.collision_yaw_rate[:, None]]) # [N, 5]
 
         # [N - 1, 4, 4]
         T_b0__b_curr = T_b0_b[:-1]
@@ -265,11 +266,30 @@ class VLN_N1_V2_Traj(Traj):
         
         # Calculate Farthest Visible Frames Loop
         farthest_indices = []
+        N = len(self.df)
+        sub_idx_ptr = 0
         
         for i in range(len(self.df) - 1): # Process up to N-1
             depth = self.load_depth(self.depth_images[i])
             min_depth_map = scipy.ndimage.minimum_filter(depth, size=self.PATCH_SIZE, mode='nearest')
-            f_idx, _ = self.find_farthest_visible_frame_vectorized(i, min_depth_map, T_w_c)
+            
+            # Determine search range based on sub_indexes
+            # Optimized: Skip sub_indexes that have ended
+            while sub_idx_ptr < len(self.sub_indexes):
+                 _, end = self.sub_indexes[sub_idx_ptr]
+                 if end < i:
+                     sub_idx_ptr += 1
+                 else:
+                     break
+
+            search_end = N - 1
+            for k in range(sub_idx_ptr, len(self.sub_indexes)):
+                start, end = self.sub_indexes[k]
+                if start <= i <= end:
+                    search_end = end
+                    break
+            
+            f_idx, _ = self.find_farthest_visible_frame_vectorized(i, min_depth_map, T_w_c, search_end)
             farthest_indices.append(f_idx)
             
         # Vectorized relative pose computation
@@ -308,6 +328,9 @@ class VLN_N1_V2_Traj(Traj):
         self.actions = actions
 
     def __iter__(self) -> Iterable[Tuple[dict, str]]:
+        # Ensure processing is done (lazy loading for workers)
+        self.process_traj()
+        
         # Yield data
         for i in range(len(self.images)):
              # Construct frame dict similar to V1
@@ -450,12 +473,14 @@ class VLN_N1_V2_Trajectories(Trajectories):
                     # 1. Update ESDF
                     if current_esdf is not None:
                         del current_esdf
-                        import torch 
-                        torch.cuda.empty_cache()
+                        # import torch 
+                        # torch.cuda.empty_cache()
                     
                     # Assume pcd exists
                     pcd = o3d.io.read_point_cloud(str(pcd_path))
-                    current_esdf = PointCloudESDF(pcd, device="cuda:0")
+                    current_esdf = PointCloudESDF(pcd,
+                                                #    device="cuda:0"
+                                                )
 
                     # 2. Update Metadata
                     current_tasks_map = {}

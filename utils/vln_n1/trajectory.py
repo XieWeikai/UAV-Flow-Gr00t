@@ -1,6 +1,6 @@
 import cv2
 from pathlib import Path
-from typing import Callable, List, Dict, Union
+from typing import Callable, List, Dict, Union, Any
 import numpy as np
 import traceback
 from PIL import Image
@@ -212,47 +212,45 @@ class InternDataProcessor:
 
 from utils import Trajectories, Traj
 
-def validate_tasks(tasks: List[Dict]) -> bool:
-    instructions = tasks
+def _is_valid_index_pair(x: Any) -> bool:
+    if not isinstance(x, (list, tuple)) or len(x) != 2:
+        return False
+    a, b = x[0], x[1]
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return False
+    return a <= b
 
-    try:
-        sum_instruction = None
-        for i, ins in enumerate(instructions):
-            if "sum_instruction" in ins:
-                item = instructions.pop(i)
-                sum_instruction = item["sum_instruction"]
-                break
-        
-        selected_instruction = ""
-        # 10% chance to select sum_instruction
-        if sum_instruction is not None and np.random.rand() < 0.1:
-            selected_instruction = sum_instruction
-        else:
-            found = False
-            for ins in instructions:
-                if ins["sub_indexes"][0] <= 1000 <= ins["sub_indexes"][1]:
-                    if np.random.rand() < 0.5:
-                        selected_instruction = ins["sub_instruction"]
-                    else:
-                        selected_instruction = ins["revised_sub_instruction"]
-                    found = True
-                    break
-            if not found:
-                if sum_instruction is not None:
-                    selected_instruction = sum_instruction
-                elif len(instructions) > 0:
-                    selected_instruction = instructions[-1]["sub_instruction"]
-                else:
-                    # Fallback failed
-                    logging.warning("validate_tasks: No instruction found and no fallback available.")
-                    return False
-                    
-    except Exception as e:
-        traceback.print_exc()
-        logging.warning(f"Error validating tasks: {e}")
+def _is_nonempty_str(x: Any) -> bool:
+    return isinstance(x, str) and len(x.strip()) > 0
+
+def validate_tasks(tasks: List[Dict]) -> bool:
+    """
+    Returns True iff tasks contains at least one valid item of either:
+      1) sub item: {"sub_instruction": str, "revised_sub_instruction": str, "sub_indexes": [a,b]}
+      2) sum item: {"sum_instruction": str, "sum_indexes": [a,b]}
+    """
+    if not isinstance(tasks, list) or len(tasks) == 0:
         return False
 
-    return True
+    for ins in tasks:
+        if not isinstance(ins, dict):
+            continue
+
+        # Case 1: sub item
+        if (
+            (_is_nonempty_str(ins.get("sub_instruction")) or _is_nonempty_str(ins.get("revised_sub_instruction")) )
+            and
+            _is_valid_index_pair(ins.get("sub_indexes"))
+        ):
+            return True
+
+        # Case 2: sum item
+        if (
+            _is_nonempty_str(ins.get("sum_instruction")) and
+            _is_valid_index_pair(ins.get("sum_indexes"))
+        ):
+            return True
+    return False
 
 EDGE_PIX = 20     # 与边界距离阈值
 PATCH_R = 5      # Patch 半径，用于遮挡判断
@@ -389,7 +387,7 @@ class VLN_N1_Traj(Traj):
     
     @staticmethod
     def is_collision_within_patch(depth, u, v, depth_proj, H, W):
-        ui, vi = int(u), int(v)
+        ui, vi = round(u), round(v)  # int(u), int(v)
         u0 = max(0, ui - PATCH_R)
         u1 = min(W - 1, ui + PATCH_R)
         v0 = max(0, vi - PATCH_R)
@@ -481,31 +479,52 @@ class VLN_N1_Traj(Traj):
         
         # Determine search range based on sub_indexes
         search_end = len(self.images) - 1
-        for start, end in self.sub_indexes:
+        for  start, end in self.sub_indexes:
             if start <= current_idx <= end:
                 search_end = end
                 break
         
         # Search backwards from search_end to current_idx for the first visible frame (ignoring edge constraints)
-        visible_idx = -1
-        for idx in range(search_end, current_idx, -1):
+        # visible_idx = -1
+        # for idx in range(search_end, current_idx, -1):
+        #     T_w_c_target = self._get_action(idx)
+        #     T_c_current_c_target = T_c_current_w @ T_w_c_target
+        #     # Project target camera position into current camera frame
+        #     p_c_target_in_current = T_c_current_c_target[:3, 3]
+        #     proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
+            
+        #     if proj is not None:
+        #         u, v, depth_proj = proj
+        #         # Check collision (occlusion)
+        #         if not self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
+        #             visible_idx = idx
+        #             break
+
+        visible_idx = current_idx + 1
+        for idx in range(current_idx + 1, search_end + 1):
             T_w_c_target = self._get_action(idx)
             T_c_current_c_target = T_c_current_w @ T_w_c_target
             # Project target camera position into current camera frame
             p_c_target_in_current = T_c_current_c_target[:3, 3]
             proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
             
-            if proj is not None:
-                u, v, depth_proj = proj
-                # Check collision (occlusion)
-                if not self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
-                    visible_idx = idx
-                    break
+            if proj is None:
+                break
+
+            u, v, depth_proj = proj
+            # Check collision (occlusion)
+            if self.is_collision_within_patch(depth_img, u, v, depth_proj, H, W):
+                break
+
+            visible_idx = idx
         
         # If a visible frame is found, search backwards from there for the first frame that is not near the edge
-        if visible_idx != -1:
+        if visible_idx > current_idx and visible_idx <= search_end:
             for idx in range(visible_idx, current_idx, -1):
                 T_w_c_target = self._get_action(idx)
+                farthest_idx = idx
+                farthest_T_w_c = T_w_c_target
+
                 T_c_current_c_target = T_c_current_w @ T_w_c_target
                 p_c_target_in_current = T_c_current_c_target[:3, 3]
                 proj = self.project_camera_point(p_c_target_in_current, K, [H, W])
@@ -514,8 +533,6 @@ class VLN_N1_Traj(Traj):
                     u, v, depth_proj = proj
                     # Check edge constraint
                     if not self.is_near_edge(u, v, H, W):
-                        farthest_idx = idx
-                        farthest_T_w_c = T_w_c_target
                         break
 
         return farthest_idx, farthest_T_w_c

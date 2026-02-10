@@ -115,7 +115,7 @@ def port(
         
         elapsed_time = time.time() - start_time
         if (episode_index + 1) % 10 == 0:
-            logging.info(f"Submitted {episode_index + 1} / {num_episodes} episodes (elapsed {elapsed_time:.3f} s)")
+            logging.info('\033[92m' + f"Submitted {episode_index + 1} / {num_episodes} episodes (elapsed {elapsed_time:.3f} s)" + '\033[0m')
 
     logging.info("All episodes submitted. Waiting for completion...")
     creator.wait()

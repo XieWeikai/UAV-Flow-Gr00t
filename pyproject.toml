@@ -32,5 +32,6 @@ dev = [
     "ipykernel>=6.30.1",
     "jupyterlab>=4.4.9",
     "notebook>=7.4.7",
+    "py-spy>=0.4.1",
     "scipy>=1.15.3",
 ]

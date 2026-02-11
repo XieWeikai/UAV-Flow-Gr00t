@@ -29,10 +29,10 @@ class VLN_CE_Traj(Traj):
     ], dtype=np.float32)
 
     goal_keys = [
-        "relative_goal_frame_id.125cm_45deg",
         "relative_goal_frame_id.125cm_30deg",
-        "relative_goal_frame_id.60cm_30deg",
+        "relative_goal_frame_id.125cm_45deg",
         "relative_goal_frame_id.60cm_15deg",
+        "relative_goal_frame_id.60cm_30deg",
     ]
 
     @property

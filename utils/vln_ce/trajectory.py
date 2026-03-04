@@ -54,7 +54,8 @@ class VLN_CE_Traj(Traj):
             f"Length mismatch between parquet {len(self.df)} and images {len(self.images)} in {self.parquet_path}"
         
         self.length = len(self.df)
-        
+
+    def _process_traj(self):
         # Process Poses
         # Ensure it's a stacked numpy array [N, 4, 4]
         # df["pose.125cm_0deg"] usually contains arrays/lists
@@ -88,14 +89,21 @@ class VLN_CE_Traj(Traj):
         self.action_deltas = np.concatenate([deltas, last_delta], axis=0) # [N, 4]
         
         # Calculate Goal Actions (last 4 values)
-        goal_frame_idx = None
+        # Collect arrays for all keys that exist in the dataframe
+        available_goal_arrays = []
         for key in self.goal_keys:
             if key in self.df.columns:
-                goal_frame_idx = self.df[key].to_numpy()
-                break
+                available_goal_arrays.append(self.df[key].to_numpy())
         
-        if goal_frame_idx is None:
+        if not available_goal_arrays:
             raise KeyError(f"None of the goal keys {self.goal_keys} found in dataframe columns: {self.df.columns}")
+        
+        # For each row, use the first key (in order) whose value is not -1;
+        # fall back to -1 if all available keys have -1 for that row.
+        goal_frame_idx = np.full(self.length, -1, dtype=available_goal_arrays[0].dtype)
+        for arr in reversed(available_goal_arrays):
+            mask = arr != -1
+            goal_frame_idx[mask] = arr[mask]
 
         actions_raw = self.df["action"].to_numpy()
         refined_goals = goal_frame_idx.copy()
@@ -116,7 +124,6 @@ class VLN_CE_Traj(Traj):
                 refined_goals[i] = found - i
             else:
                 refined_goals[i] = N - 1 - i
-            
         
         # Calculate relative pose to refined goal
         target_indices = refined_goals + np.arange(N)
@@ -144,6 +151,7 @@ class VLN_CE_Traj(Traj):
         return self.length
     
     def __iter__(self) -> Iterable[tuple[dict, str]]:
+        self._process_traj()
         for i in range(self.length):
             frame = {
                 "annotation.human.action.task_description": np.array([self.task_idx], dtype=np.int32),

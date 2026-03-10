@@ -2,8 +2,8 @@
 set -o pipefail  # Ensure pipeline errors are caught
 
 # Configuration
-OUTPUT_DIR="/data-10T/InternData-N1"
-NUM_PROCESSES=16
+OUTPUT_DIR="/data-10T/InternData-N1/tmp"
+NUM_PROCESSES=32
 MAX_LOG_LINES=2000
 EXTRA_ARGS=""
 

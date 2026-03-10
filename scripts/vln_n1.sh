@@ -2,10 +2,10 @@
 set -o pipefail  # Ensure pipeline errors are caught
 
 # Configuration
-OUTPUT_DIR="/data-25T/InternData-N1/exp"
-NUM_PROCESSES=8
+OUTPUT_DIR="/data-10T/InternData-N1/exp"
+NUM_PROCESSES=48
 MAX_LOG_LINES=2000
-EXTRA_ARGS="--roll_limit 40.0"
+EXTRA_ARGS="--roll_limit 5.0"
 
 # Directories to process
 # Format: "Path"
@@ -198,7 +198,7 @@ for dir in "${TARGET_DIRS[@]}"; do
     echo "[$NAME] Running... (Log: $LOG_FILE, Max Lines: $MAX_LOG_LINES)"
     
     # Run using the wrapper function for log limiting
-    run_with_log_limit "uv run vln_n1_v2.py --raw_dir '$dir' --output_dir '$OUTPUT_DIR' --num_processes '$NUM_PROCESSES' $EXTRA_ARGS" "$LOG_FILE" &
+    run_with_log_limit "uv run vln_n1_accelerate.py --raw_dir '$dir' --output_dir '$OUTPUT_DIR' --num_processes '$NUM_PROCESSES' $EXTRA_ARGS" "$LOG_FILE" &
     
     PID=$!
     PIDS+=($PID)

@@ -122,29 +122,6 @@ class VLN_CE_Traj(Traj):
         T_body_b = np.einsum('ij,njk->nik', T_body_w, T_w_b)
         self.poses_body = self.get_poses(T_body_b) # observation.state
         
-        # Calculate Action Deltas (first 4 values)
-        # Delta is relative pose from current to next frame
-        T_body_b_current = T_body_b[:-1]
-        T_b_current_body = homogeneous_inv(T_body_b_current)
-        T_body_b_next = T_body_b[1:]
-        
-        # [N-1, 4, 4]
-        T_current_next = T_b_current_body @ T_body_b_next
-        deltas = self.get_poses(T_current_next)
-        
-        # Pad last frame with identity pose (no movement).
-        last_delta = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
-        self.action_deltas = np.concatenate([deltas, last_delta], axis=0) # [N, 4]
-        
-        # Calculate Goal Actions (last 4 values) using a fixed lookahead window.
-        N = self.length
-        target_indices = np.minimum(np.arange(N) + 20, N - 1)
-        
-        T_body_goal = T_body_b[target_indices] # [N, 4, 4]
-        T_b_body = homogeneous_inv(T_body_b) # [N, 4, 4]
-        T_b_goal = T_b_body @ T_body_goal # [N, 4, 4]
-        self.action_goals = self.get_poses(T_b_goal) # [N, 4]
-
     def get_poses(self, T: np.ndarray) -> np.ndarray:
         """
         Get poses in [tx, ty, tz, qx, qy, qz, qw] format.
@@ -163,17 +140,12 @@ class VLN_CE_Traj(Traj):
     
     def __iter__(self) -> Iterable[tuple[dict, str]]:
         self._process_traj()
-        has_reason = self.reason_col in self.df.columns
         for i in range(self.length):
-            reason = str(self.df.iloc[i][self.reason_col]) if has_reason else ""
-            if pd.isna(reason):
-                reason = ""
             frame = {
                 "annotation.human.action.task_description": np.array([self.task_idx], dtype=np.int32),
                 "observation.state": self.poses_body[i],
                 "video.front": np.array(Image.open(self.images[i]).convert("RGB")),
-                "action": np.concatenate([self.action_deltas[i], self.action_goals[i]]).astype(np.float32),
-                "extra.cot": reason,
+                "action": self.poses_body[i].astype(np.float32),
             }
             yield frame, self.task
 
@@ -209,24 +181,12 @@ class VLN_CE_Trajectories(Trajectories):
                 "channels",
             ],
         },
-        # The action command sent to the drone.
-        # first 4 values are [dx, dy, dz, dyaw] to the next frame
-        # last 4 values are goal pose of the to the current frame
         "action": {
             "dtype": "float32",
-            "shape": (14,),
+            "shape": (7,),
             "names": {
-                "axes": [
-                    "curr_to_next_tx", "curr_to_next_ty", "curr_to_next_tz", "curr_to_next_qx", "curr_to_next_qy", "curr_to_next_qz", "curr_to_next_qw",
-                    "curr_to_goal_tx", "curr_to_goal_ty", "curr_to_goal_tz", "curr_to_goal_qx", "curr_to_goal_qy", "curr_to_goal_qz", "curr_to_goal_qw",
-                ],
+                "axes": ["tx", "ty", "tz", "qx", "qy", "qz", "qw"],
             },
-        },
-        # Per-frame chain-of-thought reasoning from CoT annotations.
-        "extra.cot": {
-            "dtype": "string",
-            "shape": (1,),
-            "names": None,
         },
     }
 

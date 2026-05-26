@@ -92,23 +92,8 @@ def _manual_expected(sample_root: Path, viewpoint: str) -> dict[str, np.ndarray]
     t_body_w = homogeneous_inv(t_w_b[0])
     t_body_b = np.einsum("ij,njk->nik", t_body_w, t_w_b)
 
-    t_current_next = homogeneous_inv(t_body_b[:-1]) @ t_body_b[1:]
-    action_deltas = _poses_from_transform(t_current_next)
-    action_deltas = np.concatenate(
-        [action_deltas, _identity_pose()[None, :]],
-        axis=0,
-    )
-
-    n = len(t_body_b)
-    target_indices = np.minimum(np.arange(n) + 20, n - 1)
-    t_b_goal = homogeneous_inv(t_body_b) @ t_body_b[target_indices]
-    action_goals = _poses_from_transform(t_b_goal)
-
     return {
         "poses_body": _poses_from_transform(t_body_b),
-        "action_deltas": action_deltas,
-        "action_goals": action_goals,
-        "target_indices": target_indices,
     }
 
 
@@ -149,13 +134,9 @@ def test_trajectory_matches_manual_geometry(sample_root: Path, viewpoint: str):
     assert np.allclose(traj.T_b_c, _expected_camera_body_transforms(viewpoint)[0], atol=ATOL)
     assert np.allclose(traj.camera_intrinsics, _expected_intrinsics(traj.image_width, traj.image_height), atol=ATOL)
     assert np.allclose(traj.poses_body, expected["poses_body"], atol=ATOL)
-    assert np.allclose(traj.action_deltas, expected["action_deltas"], atol=ATOL)
-    assert np.allclose(traj.action_goals, expected["action_goals"], atol=ATOL)
     assert np.allclose(traj.metadata["video.front.body_from_camera"], traj.T_b_c, atol=ATOL)
     assert np.allclose(traj.metadata["video.front.K"], traj.camera_intrinsics, atol=ATOL)
     assert np.allclose(traj.poses_body[0], _identity_pose(), atol=ATOL)
-    assert np.allclose(traj.action_deltas[-1], _identity_pose(), atol=ATOL)
-    assert np.allclose(traj.action_goals[-1], _identity_pose(), atol=ATOL)
 
 
 @pytest.mark.parametrize("viewpoint", VIEWPOINTS)
@@ -210,16 +191,14 @@ def test_end_to_end_conversion_outputs(sample_root: Path, tmp_path: Path, viewpo
         expected["poses_body"],
         atol=ATOL,
     )
+    actions = np.stack(converted_df["action"].to_numpy())
+    assert actions.shape[1] == 7
     assert np.allclose(
-        np.stack(converted_df["action"].to_numpy())[:, :7],
-        expected["action_deltas"],
+        actions,
+        expected["poses_body"],
         atol=ATOL,
     )
-    assert np.allclose(
-        np.stack(converted_df["action"].to_numpy())[:, 7:],
-        expected["action_goals"],
-        atol=ATOL,
-    )
+    assert "extra.cot" not in converted_df.columns
 
     with open(extras_file, "r") as f:
         extras = json.loads(next(f))

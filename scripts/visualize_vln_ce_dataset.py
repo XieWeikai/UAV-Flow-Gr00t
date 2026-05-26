@@ -1,16 +1,19 @@
 import json
+import os
 from argparse import ArgumentParser
 from pathlib import Path
 
 import cv2
 import imageio.v2 as imageio
-import matplotlib
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+import matplotlib
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
@@ -31,6 +34,11 @@ def parse_args():
     parser.add_argument("--axis-length", type=float, default=0.35, help="Axis length for body and camera frames.")
     parser.add_argument("--fps", type=float, default=None, help="Override GIF fps. Defaults to dataset fps.")
     parser.add_argument("--max-frames", type=int, default=None, help="Optional frame cap for quicker previews.")
+    parser.add_argument(
+        "--skip-action-check",
+        action="store_true",
+        help="Skip checking that action matches observation.state.",
+    )
     return parser.parse_args()
 
 
@@ -73,10 +81,9 @@ def read_video_frames(video_path: Path, max_frames: int | None = None) -> list[n
     return frames
 
 
-def compute_plot_limits(body_positions: np.ndarray, camera_positions: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-    all_points = np.concatenate([body_positions, camera_positions], axis=0)
-    mins = all_points.min(axis=0)
-    maxs = all_points.max(axis=0)
+def compute_plot_limits(positions: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    mins = positions.min(axis=0)
+    maxs = positions.max(axis=0)
     center = (mins + maxs) / 2.0
     span = np.max(maxs - mins)
     radius = max(0.5, span / 2.0 + 0.25)
@@ -119,6 +126,26 @@ def configure_axes(ax, x_lim, y_lim, z_lim, title: str):
     ax.set_title(title)
 
 
+def configure_camera_axes(ax, x_lim, y_lim, z_lim, title: str):
+    ax.set_xlim(*x_lim)
+    ax.set_ylim(*y_lim)
+    ax.set_zlim(*z_lim)
+    ax.set_xlabel("X right")
+    ax.set_ylabel("Y down")
+    ax.set_zlabel("Z forward")
+    ax.view_init(elev=28, azim=-62)
+    ax.set_title(title)
+
+
+def load_pose_array(df: pd.DataFrame, key: str) -> np.ndarray:
+    if key not in df.columns:
+        raise KeyError(f"Missing required pose column: {key}")
+    poses = np.stack(df[key].to_numpy()).astype(np.float32)
+    if poses.ndim != 2 or poses.shape[1] != 7:
+        raise ValueError(f"Expected {key} to have shape [N, 7], got {poses.shape}")
+    return poses
+
+
 def render_gif(
     states: np.ndarray,
     frames_rgb: list[np.ndarray],
@@ -132,16 +159,22 @@ def render_gif(
     frames_rgb = frames_rgb[:num_frames]
 
     body_transforms = np.stack([pose7d_to_matrix(pose) for pose in states], axis=0)
-    camera_transforms = np.stack([t_body @ body_from_camera for t_body in body_transforms], axis=0)
+    body_camera_transforms = np.stack([t_body @ body_from_camera for t_body in body_transforms], axis=0)
+    camera0_from_body0 = np.linalg.inv(body_camera_transforms[0])
+    camera_transforms = np.stack(
+        [camera0_from_body0 @ t_body_camera for t_body_camera in body_camera_transforms],
+        axis=0,
+    )
     body_positions = body_transforms[:, :3, 3]
     camera_positions = camera_transforms[:, :3, 3]
 
-    x_lim, y_lim, z_lim = compute_plot_limits(body_positions, camera_positions)
+    body_x_lim, body_y_lim, body_z_lim = compute_plot_limits(body_positions)
+    camera_x_lim, camera_y_lim, camera_z_lim = compute_plot_limits(camera_positions)
     gif_frames = []
 
     for frame_idx in range(num_frames):
-        fig = plt.figure(figsize=(12, 8), constrained_layout=True)
-        gs = fig.add_gridspec(2, 2, width_ratios=[1.15, 1.0], height_ratios=[1.0, 1.0])
+        fig = plt.figure(figsize=(14, 7), constrained_layout=True)
+        gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.0], height_ratios=[1.0, 1.0])
         ax_body = fig.add_subplot(gs[0, 0], projection="3d")
         ax_camera = fig.add_subplot(gs[1, 0], projection="3d")
         ax_img = fig.add_subplot(gs[:, 1])
@@ -178,7 +211,13 @@ def render_gif(
             color="black",
             s=40,
         )
-        configure_axes(ax_body, x_lim, y_lim, z_lim, "Body Trajectory + Body Frame")
+        configure_axes(
+            ax_body,
+            body_x_lim,
+            body_y_lim,
+            body_z_lim,
+            "Body Motion in Initial Body Frame",
+        )
         ax_body.legend(loc="upper left", fontsize=8)
 
         ax_camera.plot(
@@ -213,17 +252,19 @@ def render_gif(
             color="#444444",
             s=36,
         )
-        configure_axes(ax_camera, x_lim, y_lim, z_lim, "Camera Trajectory + Camera Frame")
+        configure_camera_axes(
+            ax_camera,
+            camera_x_lim,
+            camera_y_lim,
+            camera_z_lim,
+            "Camera Motion in Initial Camera Frame",
+        )
         ax_camera.legend(loc="upper left", fontsize=8)
 
         ax_img.imshow(frames_rgb[frame_idx])
         ax_img.axis("off")
-        ax_img.set_title(f"video.front frame {frame_idx}")
+        ax_img.set_title(f"video.front | frame {frame_idx}")
 
-        fig.suptitle(
-            "Left: body and camera shown separately | Right: synchronized RGB",
-            fontsize=12,
-        )
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
         image = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[..., :3]
@@ -247,7 +288,15 @@ def main():
 
     df = pd.read_parquet(data_path)
     extras = load_episode_extras(extras_path, args.episode_index)
-    states = np.stack(df["observation.state"].to_numpy()).astype(np.float32)
+    states = load_pose_array(df, "observation.state")
+    actions = load_pose_array(df, "action")
+    if not args.skip_action_check and not np.allclose(actions, states, atol=1e-5):
+        max_diff = float(np.max(np.abs(actions - states)))
+        raise ValueError(
+            f"Converted action is expected to match observation.state, but max diff is {max_diff:.6g}. "
+            "Use --skip-action-check to visualize anyway."
+        )
+
     body_from_camera = np.array(extras["video.front.body_from_camera"], dtype=np.float32)
     frames_rgb = read_video_frames(video_path, max_frames=args.max_frames)
     fps = args.fps or meta.fps

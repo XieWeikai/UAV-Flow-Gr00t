@@ -1,5 +1,55 @@
 from __future__ import annotations
 
+"""Unreal Go2 episode -> LeRobot v2.1 转换入口。
+
+典型用法：
+    .\\.venv\\Scripts\\python.exe unreal.py ^
+        --raw_dir C:/Data/Saved/scene_0002/szt/episode_000000 ^
+        --output_dir ./tmp ^
+        --dataset_name unreal_go2_test ^
+        --num_processes 1
+
+`--raw_dir` 可传三种层级：
+    1. UE OutputRoot，例如 C:/Data/Saved
+    2. 某个 scene/user 目录，例如 C:/Data/Saved/scene_0002/szt
+    3. 单个 episode 目录，例如 C:/Data/Saved/scene_0002/szt/episode_000000
+
+脚本会递归查找 `episode_meta.json`，只转换 `status == "completed"` 且存在
+`frames.jsonl` 的 episode。默认导出 front/rear/left/right 四路 RGB；可用
+`--camera_keys front` 或 `--camera_keys front,left,right` 选择子集。
+
+输入 episode 需要包含：
+    episode_meta.json
+    frames.jsonl
+    rgb/<camera>.mp4 或 rgb/<camera>/<00000>.png 序列
+    task_info.csv（可选）
+
+输出 LeRobot 数据集包含：
+    meta/info.json
+    meta/tasks.jsonl
+    meta/episodes.jsonl
+    meta/episodes_extras.jsonl
+    data/chunk-000/episode_*.parquet
+    videos/chunk-000/video.<camera>/episode_*.mp4
+
+每帧 parquet 字段：
+    annotation.human.action.task_description
+    observation.state  # [tx, ty, tz, qx, qy, qz, qw], 单位 m, 四元数 xyzw
+    action             # 当前复制 observation.state
+
+坐标约定：
+    UE 输入：位置 cm，机体系/相机系均为 +X 前、+Y 右、+Z 上。
+    输出：位置 m，机体系 +X 前、+Y 左、+Z 上；相机系为 OpenCV +X 右、+Y 下、+Z 前。
+    trajectory 的 world 坐标系固定为第一帧机体坐标系，因此第一帧 state 应接近
+    [0, 0, 0, 0, 0, 0, 1]。
+
+外参处理：
+    `video.<camera>.body_from_camera` 是 episode 级 metadata。因为 UE 每帧都写
+    `pose` 和 `camera_pose_<camera>`，本脚本会逐帧反算 T_body<-camera，并严格检查
+    一个 episode 内外参是否固定。容差由 `--extrinsic_tolerance_translation_m` 和
+    `--extrinsic_tolerance_rotation_deg` 控制。
+"""
+
 import argparse
 import csv
 import json

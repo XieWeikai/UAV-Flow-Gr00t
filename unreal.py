@@ -490,6 +490,7 @@ class UnrealEpisodeCollection:
         initial_episodes: list[tuple] | None = None,
         initial_failures: list[dict[str, Any]] | None = None,
         initial_repairs: list[dict[str, Any]] | None = None,
+        initial_exclusions: list[dict[str, Any]] | None = None,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -502,6 +503,7 @@ class UnrealEpisodeCollection:
         self.trim_extra_tail_frame = trim_extra_tail_frame
         self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
         self.repaired_episodes: list[dict[str, Any]] = list(initial_repairs or [])
+        self.excluded_episodes: list[dict[str, Any]] = list(initial_exclusions or [])
         self.prepared_episodes: list[dict[str, Any]] = []
         self.successful_episodes: list[dict[str, Any]] = []
         self.schema_groups: dict[str, dict[str, Any]] = {}
@@ -558,13 +560,7 @@ class UnrealEpisodeCollection:
             if self.keep_all_schemas or schema == selected_schema:
                 compatible.append(episode)
                 continue
-            self._record_failure(
-                episode_dir,
-                "schema_validation",
-                ValueError(
-                    f"Schema mismatch: expected {schema_suffix(selected_schema)}, got {schema_suffix(schema)}"
-                ),
-            )
+            self._record_exclusion(episode_dir, selected_schema, schema)
 
         self.episodes = compatible
         if not self.episodes:
@@ -638,6 +634,27 @@ class UnrealEpisodeCollection:
             return
         raise error
 
+    def _record_exclusion(
+        self,
+        episode_dir: Path,
+        selected_schema: tuple[int, tuple[int, int]],
+        actual_schema: tuple[int, tuple[int, int]],
+    ):
+        exclusion = {
+            "source_episode_path": str(episode_dir),
+            "stage": "schema_filter",
+            "reason": "other_schema",
+            "selected_schema": schema_suffix(selected_schema),
+            "actual_schema": schema_suffix(actual_schema),
+        }
+        self.excluded_episodes.append(exclusion)
+        logging.info(
+            "Excluding episode from schema %s because it belongs to %s: %s",
+            exclusion["selected_schema"],
+            exclusion["actual_schema"],
+            episode_dir,
+        )
+
     def _repair_frames_if_needed(self, episode_dir: Path, meta: dict[str, Any], frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
         expected = int(meta.get("frame_count", len(frames)))
         if len(frames) == expected:
@@ -679,6 +696,7 @@ class UnrealEpisodeCollection:
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
+            initial_exclusions=[],
         )
 
     def __len__(self) -> int:
@@ -758,10 +776,12 @@ class UnrealEpisodeCollection:
             "num_successful": len(self.successful_episodes),
             "num_failed": len(self.failed_episodes),
             "num_repaired": len(self.repaired_episodes),
+            "num_excluded": len(self.excluded_episodes),
             "prepared_episodes": self.prepared_episodes,
             "successful_episodes": self.successful_episodes,
             "failed_episodes": self.failed_episodes,
             "repaired_episodes": self.repaired_episodes,
+            "excluded_episodes": self.excluded_episodes,
         }
 
 

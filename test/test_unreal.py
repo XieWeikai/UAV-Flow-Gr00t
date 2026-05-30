@@ -197,6 +197,9 @@ class UnrealConversionTests(unittest.TestCase):
             self.assertEqual(len(split_collection), 1)
             self.assertEqual(split_collection.fps, 30)
             self.assertEqual(split_collection.image_size, (6, 8))
+            self.assertEqual(len(split_collection.failed_episodes), 0)
+            self.assertEqual(len(split_collection.excluded_episodes), 1)
+            self.assertEqual(split_collection.excluded_episodes[0]["reason"], "other_schema")
 
     def test_collection_can_trim_one_extra_tail_frame(self):
         with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:

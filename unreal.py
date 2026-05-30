@@ -17,6 +17,9 @@ from __future__ import annotations
 脚本会递归查找 `episode_meta.json`，只转换 `status == "completed"` 且存在
 `frames.jsonl` 的 episode。默认导出 front/rear/left/right 四路 RGB；可用
 `--camera_keys front` 或 `--camera_keys front,left,right` 选择子集。
+如果输入根目录混有旧格式或不完整 episode，可加 `--skip_invalid_episodes`
+跳过不兼容条目。转换报告会写入 `meta/unreal_conversion_report.json`，其中记录
+已准备提交、实际成功落盘、失败或跳过的 episode。
 
 输入 episode 需要包含：
     episode_meta.json
@@ -56,6 +59,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -102,6 +106,11 @@ def parse_args():
     parser.add_argument("--pix_fmt", type=str, default="auto", choices=["auto", "yuv420p", "yuv444p"], help="Video pixel format.")
     parser.add_argument("--extrinsic_tolerance_translation_m", type=float, default=1e-4)
     parser.add_argument("--extrinsic_tolerance_rotation_deg", type=float, default=0.1)
+    parser.add_argument(
+        "--skip_invalid_episodes",
+        action="store_true",
+        help="Skip incompatible episodes and record them in meta/unreal_conversion_report.json.",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +120,36 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def json_default(value: Any):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def write_json(path: Path, payload: dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2, default=json_default)
+        file.write("\n")
+
+
+def load_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
     with path.open("r", encoding="utf-8") as file:
         return [json.loads(line) for line in file if line.strip()]
 
@@ -373,6 +412,7 @@ class UnrealEpisode:
             "original_episode_index": int(self.meta.get("episode_index", -1)),
             "map_name": self.meta.get("map_name", ""),
             "frame_count": len(self.frames),
+            "task": self.task,
             "task_info": self.task_info,
         }
         for camera in self.camera_keys:
@@ -413,15 +453,25 @@ class UnrealEpisodeCollection:
         get_task_idx,
         translation_tolerance_m: float,
         rotation_tolerance_deg: float,
+        skip_invalid_episodes: bool = False,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
         self.get_task_idx = get_task_idx
         self.translation_tolerance_m = translation_tolerance_m
         self.rotation_tolerance_deg = rotation_tolerance_deg
+        self.skip_invalid_episodes = skip_invalid_episodes
+        self.failed_episodes: list[dict[str, Any]] = []
+        self.prepared_episodes: list[dict[str, Any]] = []
+        self.successful_episodes: list[dict[str, Any]] = []
         self.episodes = self._load_episodes()
 
         if not self.episodes:
+            if self.skip_invalid_episodes:
+                self.fps = 0
+                self.image_size = (0, 0)
+                self.FEATURES = {}
+                return
             raise ValueError(f"No completed Unreal episodes found under {self.raw_dir}")
 
         first_meta, first_frames = self.episodes[0][1], self.episodes[0][2]
@@ -429,48 +479,93 @@ class UnrealEpisodeCollection:
         self.image_size = (int(first_meta["capture_height"]), int(first_meta["capture_width"]))
         self.FEATURES = build_features(self.image_size, self.camera_keys)
 
-        for episode_dir, meta, frames, _, _, _ in self.episodes:
-            fps = int(round(float(meta["sample_rate_hz"])))
-            image_size = (int(meta["capture_height"]), int(meta["capture_width"]))
-            if fps != self.fps:
-                raise ValueError(f"FPS mismatch in {episode_dir}: expected {self.fps}, got {fps}")
-            if image_size != self.image_size:
-                raise ValueError(f"Resolution mismatch in {episode_dir}: expected {self.image_size}, got {image_size}")
-            if len(frames) != int(meta.get("frame_count", len(frames))):
-                raise ValueError(f"frame_count mismatch in {episode_dir}")
+        compatible = []
+        for episode in self.episodes:
+            episode_dir, meta, frames, _, _, _ = episode
+            try:
+                fps = int(round(float(meta["sample_rate_hz"])))
+                image_size = (int(meta["capture_height"]), int(meta["capture_width"]))
+                if fps != self.fps:
+                    raise ValueError(f"FPS mismatch: expected {self.fps}, got {fps}")
+                if image_size != self.image_size:
+                    raise ValueError(f"Resolution mismatch: expected {self.image_size}, got {image_size}")
+                if len(frames) != int(meta.get("frame_count", len(frames))):
+                    raise ValueError(f"frame_count mismatch: meta={meta.get('frame_count')} frames={len(frames)}")
+                compatible.append(episode)
+            except Exception as exc:
+                self._record_failure(episode_dir, "schema_validation", exc)
+
+        self.episodes = compatible
+        if not self.episodes:
+            if self.skip_invalid_episodes:
+                self.fps = 0
+                self.image_size = (0, 0)
+                self.FEATURES = {}
+                return
+            raise ValueError(f"No compatible Unreal episodes found under {self.raw_dir}")
 
     def _load_episodes(self):
         loaded = []
-        for episode_dir in scan_episode_dirs(self.raw_dir):
+        episode_dirs = scan_episode_dirs(self.raw_dir)
+        logging.info("Found %d episode_meta.json files under %s", len(episode_dirs), self.raw_dir)
+
+        for index, episode_dir in enumerate(episode_dirs, start=1):
+            logging.info("Scanning episode %d / %d: %s", index, len(episode_dirs), episode_dir)
             meta_path = episode_dir / "episode_meta.json"
             frames_path = episode_dir / "frames.jsonl"
-            if not frames_path.exists():
-                continue
-            meta = load_json(meta_path)
-            if meta.get("status") != "completed":
-                continue
+            try:
+                if not frames_path.exists():
+                    raise ValueError("missing frames.jsonl")
+                meta = load_json(meta_path)
+                if meta.get("status") != "completed":
+                    reason = f"episode status is {meta.get('status')!r}, expected 'completed'"
+                    self.failed_episodes.append(
+                        {
+                            "source_episode_path": str(episode_dir),
+                            "stage": "episode_status",
+                            "error": reason,
+                        }
+                    )
+                    logging.info("Skipping non-completed episode at %s: %s", episode_dir, reason)
+                    continue
 
-            missing = [camera for camera in self.camera_keys if camera not in (meta.get("camera_names") or [])]
-            if missing:
-                raise ValueError(f"{episode_dir} is missing cameras in episode_meta.json: {missing}")
+                missing = [camera for camera in self.camera_keys if camera not in (meta.get("camera_names") or [])]
+                if missing:
+                    raise ValueError(f"missing cameras in episode_meta.json: {missing}")
 
-            frames = load_jsonl(frames_path)
-            for frame in frames:
-                for camera in self.camera_keys:
-                    if f"camera_pose_{camera}" not in frame or f"K_{camera}" not in frame:
-                        raise ValueError(f"{episode_dir} frame {frame.get('frame_index')} missing camera fields for {camera}")
+                frames = load_jsonl(frames_path)
+                for frame in frames:
+                    for camera in self.camera_keys:
+                        if f"camera_pose_{camera}" not in frame or f"K_{camera}" not in frame:
+                            raise ValueError(f"frame {frame.get('frame_index')} missing camera fields for {camera}")
 
-            task, task_info = load_task_info(episode_dir)
-            body_from_camera = validate_fixed_extrinsics(
-                episode_dir,
-                frames,
-                self.camera_keys,
-                self.translation_tolerance_m,
-                self.rotation_tolerance_deg,
-            )
-            loaded.append((episode_dir, meta, frames, task, task_info, body_from_camera))
+                task, task_info = load_task_info(episode_dir)
+                logging.info("Validating fixed camera extrinsics for %s", episode_dir)
+                body_from_camera = validate_fixed_extrinsics(
+                    episode_dir,
+                    frames,
+                    self.camera_keys,
+                    self.translation_tolerance_m,
+                    self.rotation_tolerance_deg,
+                )
+                loaded.append((episode_dir, meta, frames, task, task_info, body_from_camera))
+                logging.info("Accepted episode %s with %d frames", episode_dir, len(frames))
+            except Exception as exc:
+                self._record_failure(episode_dir, "episode_scan", exc)
 
         return loaded
+
+    def _record_failure(self, episode_dir: Path, stage: str, error: Exception):
+        failure = {
+            "source_episode_path": str(episode_dir),
+            "stage": stage,
+            "error": str(error),
+        }
+        self.failed_episodes.append(failure)
+        if self.skip_invalid_episodes:
+            logging.warning("Skipping invalid episode at %s during %s: %s", episode_dir, stage, error)
+            return
+        raise error
 
     def __len__(self) -> int:
         return len(self.episodes)
@@ -478,7 +573,85 @@ class UnrealEpisodeCollection:
     def __iter__(self):
         for episode_dir, meta, frames, task, task_info, body_from_camera in self.episodes:
             task_idx = self.get_task_idx(task)
-            yield UnrealEpisode(episode_dir, meta, frames, self.camera_keys, task, task_idx, task_info, body_from_camera)
+            try:
+                episode = UnrealEpisode(episode_dir, meta, frames, self.camera_keys, task, task_idx, task_info, body_from_camera)
+            except Exception as exc:
+                self._record_failure(episode_dir, "episode_prepare", exc)
+                continue
+
+            self.prepared_episodes.append(
+                {
+                    "source_episode_path": str(episode_dir),
+                    "original_episode_index": int(meta.get("episode_index", -1)),
+                    "frame_count": len(frames),
+                    "task": task,
+                }
+            )
+            yield episode
+
+    def sync_successful_episodes_from_output(self, root: Path):
+        """从实际写出的 extras metadata 回读成功 episode，避免把仅提交到队列的任务误报为成功。"""
+        extras_path = root / "meta" / "episodes_extras.jsonl"
+        extras = load_jsonl_dicts(extras_path)
+        if not extras:
+            logging.warning("No episodes_extras.jsonl found or no extras written at %s", extras_path)
+            self.successful_episodes = []
+        else:
+            self.successful_episodes = [
+                {
+                    "source_episode_path": str(item.get("source_episode_path", "")),
+                    "episode_index": item.get("episode_index"),
+                    "original_episode_index": item.get("original_episode_index"),
+                    "frame_count": item.get("frame_count"),
+                    "task": item.get("task", ""),
+                }
+                for item in extras
+            ]
+
+        success_sources = {item["source_episode_path"] for item in self.successful_episodes if item["source_episode_path"]}
+        existing_failures = {
+            (item.get("source_episode_path"), item.get("stage"))
+            for item in self.failed_episodes
+        }
+        for item in self.prepared_episodes:
+            source_path = item["source_episode_path"]
+            key = (source_path, "output_validation")
+            if source_path not in success_sources and key not in existing_failures:
+                self.failed_episodes.append(
+                    {
+                        "source_episode_path": source_path,
+                        "stage": "output_validation",
+                        "error": "episode was submitted but no episodes_extras entry was written",
+                    }
+                )
+                existing_failures.add(key)
+
+    def build_report(self, root: Path, started_at: str, completed_at: str | None, status: str) -> dict[str, Any]:
+        return {
+            "status": status,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "raw_dir": str(self.raw_dir),
+            "output_root": str(root),
+            "camera_keys": self.camera_keys,
+            "num_prepared": len(self.prepared_episodes),
+            "num_successful": len(self.successful_episodes),
+            "num_failed": len(self.failed_episodes),
+            "prepared_episodes": self.prepared_episodes,
+            "successful_episodes": self.successful_episodes,
+            "failed_episodes": self.failed_episodes,
+        }
+
+
+def write_conversion_report(root: Path, report: dict[str, Any]):
+    report_path = root / "meta" / "unreal_conversion_report.json"
+    write_json(report_path, report)
+    logging.info(
+        "Wrote conversion report: %s (successful=%s failed=%s)",
+        report_path,
+        report.get("num_successful"),
+        report.get("num_failed"),
+    )
 
 
 def validate_lerobot_dataset(repo_id: str, root: str | Path):
@@ -505,6 +678,8 @@ def main():
     dataset_name = args.dataset_name or raw_dir.name
     root = output_dir / dataset_name
     camera_keys = parse_camera_keys(args.camera_keys)
+    started_at = utc_now_iso()
+    logging.info("Starting Unreal conversion raw_dir=%s output=%s dataset=%s cameras=%s", raw_dir, root, dataset_name, camera_keys)
 
     collection = UnrealEpisodeCollection(
         raw_dir=raw_dir,
@@ -512,8 +687,21 @@ def main():
         get_task_idx=lambda _task: 0,
         translation_tolerance_m=args.extrinsic_tolerance_translation_m,
         rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
+        skip_invalid_episodes=args.skip_invalid_episodes,
+    )
+    if len(collection) == 0:
+        completed_at = utc_now_iso()
+        report = collection.build_report(root, started_at, completed_at, "no_valid_episodes")
+        write_conversion_report(root, report)
+        raise ValueError(f"No compatible Unreal episodes found under {raw_dir}")
+
+    logging.info(
+        "Prepared %d compatible episodes; skipped/failed during scan: %d",
+        len(collection),
+        len(collection.failed_episodes),
     )
     resolved_pix_fmt = select_video_pixel_format(collection.image_size, codec=args.codec, pix_fmt=args.pix_fmt)
+    logging.info("Using fps=%s image_size=%s pix_fmt=%s", collection.fps, collection.image_size, resolved_pix_fmt)
 
     creator = LeRobotCreator(
         root=str(root),
@@ -529,13 +717,27 @@ def main():
     collection.get_task_idx = creator.add_task
 
     start_time = time.time()
-    for episode_index, episode in enumerate(collection, start=1):
-        creator.submit_episode(episode)
-        logging.info("Submitted episode %s / %s: %s", episode_index, len(collection), episode.episode_dir)
+    status = "failed"
+    try:
+        for episode_index, episode in enumerate(collection, start=1):
+            logging.info("Submitting episode %s / %s: %s", episode_index, len(collection), episode.episode_dir)
+            creator.submit_episode(episode)
 
-    creator.wait()
-    validate_lerobot_dataset(repo_id=dataset_name, root=root)
-    logging.info("Done! %d episodes in %.2fs -> %s", len(collection), time.time() - start_time, root)
+        logging.info("Waiting for worker processes and video encoders to finish")
+        creator.wait()
+        logging.info("Reading written episode metadata from %s", root / "meta" / "episodes_extras.jsonl")
+        collection.sync_successful_episodes_from_output(root)
+        logging.info("Validating generated LeRobot dataset at %s", root)
+        validate_lerobot_dataset(repo_id=dataset_name, root=root)
+        status = "completed"
+    finally:
+        if status != "completed":
+            collection.sync_successful_episodes_from_output(root)
+        completed_at = utc_now_iso()
+        report = collection.build_report(root, started_at, completed_at, status)
+        write_conversion_report(root, report)
+
+    logging.info("Done! %d episodes in %.2fs -> %s", len(collection.successful_episodes), time.time() - start_time, root)
 
 
 if __name__ == "__main__":

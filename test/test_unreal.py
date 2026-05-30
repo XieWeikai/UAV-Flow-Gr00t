@@ -11,6 +11,7 @@ from unreal import (
     STATE_KEY,
     TASK_DESCRIPTION_KEY,
     UnrealEpisode,
+    UnrealEpisodeCollection,
     body_from_camera_for_frame,
     build_features,
     intrinsic_4,
@@ -121,6 +122,42 @@ class UnrealConversionTests(unittest.TestCase):
         self.assertEqual(features["video.front"]["shape"], (3, 4, 3))
         self.assertEqual(features["video.rear"]["shape"], (3, 4, 3))
         self.assertEqual(features[STATE_KEY]["shape"], (7,))
+
+    def test_collection_can_skip_invalid_episode(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            write_episode(root, [make_frame(0, 0.0, 100.0)])
+
+            invalid_dir = root / "scene_0001" / "user_0002" / "episode_000000"
+            invalid_dir.mkdir(parents=True)
+            (invalid_dir / "episode_meta.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "episode_index": 0,
+                        "capture_width": 4,
+                        "capture_height": 3,
+                        "sample_rate_hz": 10,
+                        "frame_count": 1,
+                        "camera_names": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (invalid_dir / "frames.jsonl").write_text(json.dumps(make_frame(0, 0.0, 100.0)) + "\n", encoding="utf-8")
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+            )
+
+            self.assertEqual(len(collection), 1)
+            self.assertEqual(len(collection.failed_episodes), 1)
+            self.assertIn("missing cameras", collection.failed_episodes[0]["error"])
 
 
 if __name__ == "__main__":

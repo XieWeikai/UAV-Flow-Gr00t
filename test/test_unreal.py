@@ -41,6 +41,7 @@ def write_episode(
     width: int = 4,
     height: int = 3,
     fps: int = 10,
+    meta_frame_count: int | None = None,
 ):
     episode_dir = root / "scene_0001" / user_id / episode_id
     (episode_dir / "rgb" / "front").mkdir(parents=True)
@@ -52,7 +53,7 @@ def write_episode(
         "capture_width": width,
         "capture_height": height,
         "sample_rate_hz": fps,
-        "frame_count": len(frames),
+        "frame_count": len(frames) if meta_frame_count is None else meta_frame_count,
         "camera_names": ["front"],
     }
     (episode_dir / "episode_meta.json").write_text(json.dumps(meta), encoding="utf-8")
@@ -196,6 +197,27 @@ class UnrealConversionTests(unittest.TestCase):
             self.assertEqual(len(split_collection), 1)
             self.assertEqual(split_collection.fps, 30)
             self.assertEqual(split_collection.image_size, (6, 8))
+
+    def test_collection_can_trim_one_extra_tail_frame(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            frames = [make_frame(0, 0.0, 100.0), make_frame(1, 100.0, 200.0)]
+            write_episode(root, frames, meta_frame_count=1)
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                trim_extra_tail_frame=True,
+            )
+
+            self.assertEqual(len(collection), 1)
+            self.assertEqual(len(collection.episodes[0][2]), 1)
+            self.assertEqual(len(collection.repaired_episodes), 1)
+            self.assertEqual(collection.repaired_episodes[0]["action"], "trimmed_extra_tail_frame")
 
 
 if __name__ == "__main__":

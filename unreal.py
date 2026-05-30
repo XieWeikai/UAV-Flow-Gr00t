@@ -26,6 +26,9 @@ from __future__ import annotations
     output/3d_simu_ue_pointnav_fps30_480x640
 拆分模式下还会额外写出总报告：
     output/3d_simu_ue_pointnav_conversion_report.json
+如果旧数据存在“frames.jsonl 比 episode_meta.frame_count 多 1 行”的半帧问题，可加
+`--trim_extra_tail_frame`。脚本只会在最后一行 frame_index 正好等于 frame_count 时，
+在内存中裁掉最后一行，不会修改原始 episode 文件。
 
 输入 episode 需要包含：
     episode_meta.json
@@ -121,6 +124,11 @@ def parse_args():
         "--split_by_schema",
         action="store_true",
         help="Export one LeRobot dataset per fps/resolution schema.",
+    )
+    parser.add_argument(
+        "--trim_extra_tail_frame",
+        action="store_true",
+        help="Trim one extra tail frame from frames.jsonl when it is exactly meta.frame_count + 1.",
     )
     return parser.parse_args()
 
@@ -478,8 +486,10 @@ class UnrealEpisodeCollection:
         skip_invalid_episodes: bool = False,
         target_schema: tuple[int, tuple[int, int]] | None = None,
         keep_all_schemas: bool = False,
+        trim_extra_tail_frame: bool = False,
         initial_episodes: list[tuple] | None = None,
         initial_failures: list[dict[str, Any]] | None = None,
+        initial_repairs: list[dict[str, Any]] | None = None,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -489,7 +499,9 @@ class UnrealEpisodeCollection:
         self.skip_invalid_episodes = skip_invalid_episodes
         self.target_schema = target_schema
         self.keep_all_schemas = keep_all_schemas
+        self.trim_extra_tail_frame = trim_extra_tail_frame
         self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
+        self.repaired_episodes: list[dict[str, Any]] = list(initial_repairs or [])
         self.prepared_episodes: list[dict[str, Any]] = []
         self.successful_episodes: list[dict[str, Any]] = []
         self.schema_groups: dict[str, dict[str, Any]] = {}
@@ -508,8 +520,8 @@ class UnrealEpisodeCollection:
         for episode in self.episodes:
             episode_dir, meta, frames, _, _, _ = episode
             try:
-                if len(frames) != int(meta.get("frame_count", len(frames))):
-                    raise ValueError(f"frame_count mismatch: meta={meta.get('frame_count')} frames={len(frames)}")
+                frames = self._repair_frames_if_needed(episode_dir, meta, frames)
+                episode = (episode_dir, meta, frames, episode[3], episode[4], episode[5])
                 schema_candidates.append((episode_schema(meta), episode))
             except Exception as exc:
                 self._record_failure(episode_dir, "schema_validation", exc)
@@ -626,6 +638,34 @@ class UnrealEpisodeCollection:
             return
         raise error
 
+    def _repair_frames_if_needed(self, episode_dir: Path, meta: dict[str, Any], frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        expected = int(meta.get("frame_count", len(frames)))
+        if len(frames) == expected:
+            return frames
+
+        if self.trim_extra_tail_frame and len(frames) == expected + 1:
+            last_frame_index = frames[-1].get("frame_index")
+            if last_frame_index == expected:
+                repair = {
+                    "source_episode_path": str(episode_dir),
+                    "stage": "frame_count_repair",
+                    "action": "trimmed_extra_tail_frame",
+                    "meta_frame_count": expected,
+                    "original_frame_lines": len(frames),
+                    "used_frame_count": expected,
+                    "trimmed_frame_index": last_frame_index,
+                }
+                self.repaired_episodes.append(repair)
+                logging.warning(
+                    "Trimming one extra tail frame in %s: meta.frame_count=%d frames.jsonl=%d",
+                    episode_dir,
+                    expected,
+                    len(frames),
+                )
+                return frames[:expected]
+
+        raise ValueError(f"frame_count mismatch: meta={meta.get('frame_count')} frames={len(frames)}")
+
     def for_schema(self, schema: tuple[int, tuple[int, int]]) -> "UnrealEpisodeCollection":
         return UnrealEpisodeCollection(
             raw_dir=self.raw_dir,
@@ -635,8 +675,10 @@ class UnrealEpisodeCollection:
             rotation_tolerance_deg=self.rotation_tolerance_deg,
             skip_invalid_episodes=True,
             target_schema=schema,
+            trim_extra_tail_frame=self.trim_extra_tail_frame,
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
+            initial_repairs=self.repaired_episodes,
         )
 
     def __len__(self) -> int:
@@ -715,9 +757,11 @@ class UnrealEpisodeCollection:
             "num_prepared": len(self.prepared_episodes),
             "num_successful": len(self.successful_episodes),
             "num_failed": len(self.failed_episodes),
+            "num_repaired": len(self.repaired_episodes),
             "prepared_episodes": self.prepared_episodes,
             "successful_episodes": self.successful_episodes,
             "failed_episodes": self.failed_episodes,
+            "repaired_episodes": self.repaired_episodes,
         }
 
 
@@ -821,6 +865,7 @@ def main():
         rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
         skip_invalid_episodes=args.skip_invalid_episodes,
         keep_all_schemas=args.split_by_schema,
+        trim_extra_tail_frame=args.trim_extra_tail_frame,
     )
 
     if not args.split_by_schema:
@@ -866,6 +911,7 @@ def main():
         "group_reports": group_reports,
         "group_errors": group_errors,
         "scan_failures": collection.failed_episodes,
+        "repaired_episodes": collection.repaired_episodes,
     }
     top_report_path = output_dir / f"{dataset_name}_conversion_report.json"
     write_json(top_report_path, top_report)

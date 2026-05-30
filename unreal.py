@@ -20,6 +20,12 @@ from __future__ import annotations
 如果输入根目录混有旧格式或不完整 episode，可加 `--skip_invalid_episodes`
 跳过不兼容条目。转换报告会写入 `meta/unreal_conversion_report.json`，其中记录
 已准备提交、实际成功落盘、失败或跳过的 episode。
+如果同一个 raw_dir 中混有多套 fps/分辨率，可加 `--split_by_schema`，脚本会按
+`sample_rate_hz + capture_height + capture_width` 拆成多个 LeRobot 数据集，例如：
+    output/3d_simu_ue_pointnav_fps10_720x1280
+    output/3d_simu_ue_pointnav_fps30_480x640
+拆分模式下还会额外写出总报告：
+    output/3d_simu_ue_pointnav_conversion_report.json
 
 输入 episode 需要包含：
     episode_meta.json
@@ -111,6 +117,11 @@ def parse_args():
         action="store_true",
         help="Skip incompatible episodes and record them in meta/unreal_conversion_report.json.",
     )
+    parser.add_argument(
+        "--split_by_schema",
+        action="store_true",
+        help="Export one LeRobot dataset per fps/resolution schema.",
+    )
     return parser.parse_args()
 
 
@@ -188,6 +199,17 @@ def build_features(image_size: tuple[int, int], camera_keys: Iterable[str]) -> d
         }
     features[ACTION_KEY] = {"dtype": "float32", "shape": (7,), "names": {"axes": POSE_AXES}}
     return features
+
+
+def episode_schema(meta: dict[str, Any]) -> tuple[int, tuple[int, int]]:
+    fps = int(round(float(meta["sample_rate_hz"])))
+    image_size = (int(meta["capture_height"]), int(meta["capture_width"]))
+    return fps, image_size
+
+
+def schema_suffix(schema: tuple[int, tuple[int, int]]) -> str:
+    fps, (height, width) = schema
+    return f"fps{fps}_{height}x{width}"
 
 
 def unreal_pose_to_target_transform(pose: list[float] | np.ndarray) -> np.ndarray:
@@ -454,6 +476,10 @@ class UnrealEpisodeCollection:
         translation_tolerance_m: float,
         rotation_tolerance_deg: float,
         skip_invalid_episodes: bool = False,
+        target_schema: tuple[int, tuple[int, int]] | None = None,
+        keep_all_schemas: bool = False,
+        initial_episodes: list[tuple] | None = None,
+        initial_failures: list[dict[str, Any]] | None = None,
     ):
         self.raw_dir = Path(raw_dir)
         self.camera_keys = camera_keys
@@ -461,10 +487,14 @@ class UnrealEpisodeCollection:
         self.translation_tolerance_m = translation_tolerance_m
         self.rotation_tolerance_deg = rotation_tolerance_deg
         self.skip_invalid_episodes = skip_invalid_episodes
-        self.failed_episodes: list[dict[str, Any]] = []
+        self.target_schema = target_schema
+        self.keep_all_schemas = keep_all_schemas
+        self.failed_episodes: list[dict[str, Any]] = list(initial_failures or [])
         self.prepared_episodes: list[dict[str, Any]] = []
         self.successful_episodes: list[dict[str, Any]] = []
-        self.episodes = self._load_episodes()
+        self.schema_groups: dict[str, dict[str, Any]] = {}
+        self.schema_valid_episodes: list[tuple] = []
+        self.episodes = list(initial_episodes) if initial_episodes is not None else self._load_episodes()
 
         if not self.episodes:
             if self.skip_invalid_episodes:
@@ -474,26 +504,55 @@ class UnrealEpisodeCollection:
                 return
             raise ValueError(f"No completed Unreal episodes found under {self.raw_dir}")
 
-        first_meta, first_frames = self.episodes[0][1], self.episodes[0][2]
-        self.fps = int(round(float(first_meta["sample_rate_hz"])))
-        self.image_size = (int(first_meta["capture_height"]), int(first_meta["capture_width"]))
-        self.FEATURES = build_features(self.image_size, self.camera_keys)
-
-        compatible = []
+        schema_candidates: list[tuple[tuple[int, tuple[int, int]], tuple]] = []
         for episode in self.episodes:
             episode_dir, meta, frames, _, _, _ = episode
             try:
-                fps = int(round(float(meta["sample_rate_hz"])))
-                image_size = (int(meta["capture_height"]), int(meta["capture_width"]))
-                if fps != self.fps:
-                    raise ValueError(f"FPS mismatch: expected {self.fps}, got {fps}")
-                if image_size != self.image_size:
-                    raise ValueError(f"Resolution mismatch: expected {self.image_size}, got {image_size}")
                 if len(frames) != int(meta.get("frame_count", len(frames))):
                     raise ValueError(f"frame_count mismatch: meta={meta.get('frame_count')} frames={len(frames)}")
-                compatible.append(episode)
+                schema_candidates.append((episode_schema(meta), episode))
             except Exception as exc:
                 self._record_failure(episode_dir, "schema_validation", exc)
+
+        self.schema_valid_episodes = [episode for _, episode in schema_candidates]
+        self.schema_groups = {}
+        for schema, _ in schema_candidates:
+            key = schema_suffix(schema)
+            if key not in self.schema_groups:
+                fps, image_size = schema
+                self.schema_groups[key] = {
+                    "schema_key": key,
+                    "fps": fps,
+                    "image_size": image_size,
+                    "num_episodes": 0,
+                }
+            self.schema_groups[key]["num_episodes"] += 1
+
+        if not schema_candidates:
+            if self.skip_invalid_episodes:
+                self.fps = 0
+                self.image_size = (0, 0)
+                self.FEATURES = {}
+                return
+            raise ValueError(f"No schema-compatible Unreal episodes found under {self.raw_dir}")
+
+        selected_schema = self.target_schema or schema_candidates[0][0]
+        self.fps, self.image_size = selected_schema
+        self.FEATURES = build_features(self.image_size, self.camera_keys)
+
+        compatible = []
+        for schema, episode in schema_candidates:
+            episode_dir = episode[0]
+            if self.keep_all_schemas or schema == selected_schema:
+                compatible.append(episode)
+                continue
+            self._record_failure(
+                episode_dir,
+                "schema_validation",
+                ValueError(
+                    f"Schema mismatch: expected {schema_suffix(selected_schema)}, got {schema_suffix(schema)}"
+                ),
+            )
 
         self.episodes = compatible
         if not self.episodes:
@@ -567,6 +626,19 @@ class UnrealEpisodeCollection:
             return
         raise error
 
+    def for_schema(self, schema: tuple[int, tuple[int, int]]) -> "UnrealEpisodeCollection":
+        return UnrealEpisodeCollection(
+            raw_dir=self.raw_dir,
+            camera_keys=self.camera_keys,
+            get_task_idx=self.get_task_idx,
+            translation_tolerance_m=self.translation_tolerance_m,
+            rotation_tolerance_deg=self.rotation_tolerance_deg,
+            skip_invalid_episodes=True,
+            target_schema=schema,
+            initial_episodes=self.schema_valid_episodes,
+            initial_failures=self.failed_episodes,
+        )
+
     def __len__(self) -> int:
         return len(self.episodes)
 
@@ -634,6 +706,12 @@ class UnrealEpisodeCollection:
             "raw_dir": str(self.raw_dir),
             "output_root": str(root),
             "camera_keys": self.camera_keys,
+            "selected_schema": {
+                "fps": self.fps,
+                "image_size": self.image_size,
+                "schema_key": schema_suffix((self.fps, self.image_size)) if self.fps else "",
+            },
+            "schema_groups": list(self.schema_groups.values()),
             "num_prepared": len(self.prepared_episodes),
             "num_successful": len(self.successful_episodes),
             "num_failed": len(self.failed_episodes),
@@ -668,36 +746,17 @@ def validate_lerobot_dataset(repo_id: str, root: str | Path):
                 raise ValueError(f"Video file is missing: {video_path}")
 
 
-def main():
-    logging.basicConfig(level=logging.INFO)
-    args = parse_args()
-
-    raw_dir = Path(args.raw_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_name = args.dataset_name or raw_dir.name
-    root = output_dir / dataset_name
-    camera_keys = parse_camera_keys(args.camera_keys)
-    started_at = utc_now_iso()
-    logging.info("Starting Unreal conversion raw_dir=%s output=%s dataset=%s cameras=%s", raw_dir, root, dataset_name, camera_keys)
-
-    collection = UnrealEpisodeCollection(
-        raw_dir=raw_dir,
-        camera_keys=camera_keys,
-        get_task_idx=lambda _task: 0,
-        translation_tolerance_m=args.extrinsic_tolerance_translation_m,
-        rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
-        skip_invalid_episodes=args.skip_invalid_episodes,
-    )
+def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name: str, args, started_at: str) -> dict[str, Any]:
     if len(collection) == 0:
         completed_at = utc_now_iso()
         report = collection.build_report(root, started_at, completed_at, "no_valid_episodes")
         write_conversion_report(root, report)
-        raise ValueError(f"No compatible Unreal episodes found under {raw_dir}")
+        raise ValueError(f"No compatible Unreal episodes found under {collection.raw_dir}")
 
     logging.info(
-        "Prepared %d compatible episodes; skipped/failed during scan: %d",
+        "Prepared %d compatible episodes for %s; skipped/failed during scan: %d",
         len(collection),
+        root,
         len(collection.failed_episodes),
     )
     resolved_pix_fmt = select_video_pixel_format(collection.image_size, codec=args.codec, pix_fmt=args.pix_fmt)
@@ -738,6 +797,82 @@ def main():
         write_conversion_report(root, report)
 
     logging.info("Done! %d episodes in %.2fs -> %s", len(collection.successful_episodes), time.time() - start_time, root)
+    return collection.build_report(root, started_at, utc_now_iso(), status)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args()
+
+    raw_dir = Path(args.raw_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_name = args.dataset_name or raw_dir.name
+    root = output_dir / dataset_name
+    camera_keys = parse_camera_keys(args.camera_keys)
+    started_at = utc_now_iso()
+    logging.info("Starting Unreal conversion raw_dir=%s output=%s dataset=%s cameras=%s", raw_dir, root, dataset_name, camera_keys)
+
+    collection = UnrealEpisodeCollection(
+        raw_dir=raw_dir,
+        camera_keys=camera_keys,
+        get_task_idx=lambda _task: 0,
+        translation_tolerance_m=args.extrinsic_tolerance_translation_m,
+        rotation_tolerance_deg=args.extrinsic_tolerance_rotation_deg,
+        skip_invalid_episodes=args.skip_invalid_episodes,
+        keep_all_schemas=args.split_by_schema,
+    )
+
+    if not args.split_by_schema:
+        run_conversion(collection, root, dataset_name, args, started_at)
+        return
+
+    if not collection.schema_groups:
+        completed_at = utc_now_iso()
+        report = collection.build_report(root, started_at, completed_at, "no_valid_episodes")
+        write_conversion_report(root, report)
+        raise ValueError(f"No schema-compatible Unreal episodes found under {raw_dir}")
+
+    logging.info("Splitting by schema into %d LeRobot datasets", len(collection.schema_groups))
+    group_reports: list[dict[str, Any]] = []
+    group_errors: list[dict[str, str]] = []
+    for group in sorted(collection.schema_groups.values(), key=lambda item: item["schema_key"]):
+        schema = (int(group["fps"]), tuple(group["image_size"]))
+        group_dataset_name = f"{dataset_name}_{group['schema_key']}"
+        group_root = output_dir / group_dataset_name
+        logging.info(
+            "Converting schema %s -> %s (%d episodes)",
+            group["schema_key"],
+            group_root,
+            group["num_episodes"],
+        )
+        group_collection = collection.for_schema(schema)
+        try:
+            group_reports.append(run_conversion(group_collection, group_root, group_dataset_name, args, started_at))
+        except Exception as exc:
+            logging.exception("Schema conversion failed for %s", group["schema_key"])
+            group_errors.append({"schema_key": group["schema_key"], "error": str(exc)})
+
+    completed_at = utc_now_iso()
+    top_report = {
+        "status": "completed" if not group_errors else "completed_with_errors",
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "raw_dir": str(raw_dir),
+        "output_dir": str(output_dir),
+        "dataset_name": dataset_name,
+        "camera_keys": camera_keys,
+        "schema_groups": list(collection.schema_groups.values()),
+        "group_reports": group_reports,
+        "group_errors": group_errors,
+        "scan_failures": collection.failed_episodes,
+    }
+    top_report_path = output_dir / f"{dataset_name}_conversion_report.json"
+    write_json(top_report_path, top_report)
+    logging.info("Wrote split conversion report: %s", top_report_path)
+
+    if group_errors and not group_reports:
+        raise RuntimeError(f"All schema conversions failed; see {top_report_path}")
 
 
 if __name__ == "__main__":

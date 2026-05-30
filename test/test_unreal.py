@@ -33,17 +33,25 @@ def make_frame(frame_index, body_x_cm, camera_x_cm):
     }
 
 
-def write_episode(root: Path, frames: list[dict]):
-    episode_dir = root / "scene_0001" / "user_0001" / "episode_000000"
+def write_episode(
+    root: Path,
+    frames: list[dict],
+    user_id: str = "user_0001",
+    episode_id: str = "episode_000000",
+    width: int = 4,
+    height: int = 3,
+    fps: int = 10,
+):
+    episode_dir = root / "scene_0001" / user_id / episode_id
     (episode_dir / "rgb" / "front").mkdir(parents=True)
 
     meta = {
         "status": "completed",
         "episode_index": 0,
         "map_name": "Entry",
-        "capture_width": 4,
-        "capture_height": 3,
-        "sample_rate_hz": 10,
+        "capture_width": width,
+        "capture_height": height,
+        "sample_rate_hz": fps,
         "frame_count": len(frames),
         "camera_names": ["front"],
     }
@@ -53,7 +61,7 @@ def write_episode(root: Path, frames: list[dict]):
             file.write(json.dumps(frame) + "\n")
 
     for index in range(len(frames)):
-        image = np.full((3, 4, 3), index + 1, dtype=np.uint8)
+        image = np.full((height, width, 3), index + 1, dtype=np.uint8)
         Image.fromarray(image).save(episode_dir / "rgb" / "front" / f"{index:05d}.png")
 
     return episode_dir, meta
@@ -158,6 +166,36 @@ class UnrealConversionTests(unittest.TestCase):
             self.assertEqual(len(collection), 1)
             self.assertEqual(len(collection.failed_episodes), 1)
             self.assertIn("missing cameras", collection.failed_episodes[0]["error"])
+
+    def test_collection_can_split_mixed_schemas(self):
+        with tempfile.TemporaryDirectory(prefix="unreal_episode_") as tmp:
+            root = Path(tmp)
+            write_episode(root, [make_frame(0, 0.0, 100.0)], user_id="user_0001", fps=10, width=4, height=3)
+            write_episode(
+                root,
+                [make_frame(0, 0.0, 100.0)],
+                user_id="user_0002",
+                episode_id="episode_000001",
+                fps=30,
+                width=8,
+                height=6,
+            )
+
+            collection = UnrealEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                keep_all_schemas=True,
+            )
+            self.assertEqual(set(collection.schema_groups), {"fps10_3x4", "fps30_6x8"})
+
+            split_collection = collection.for_schema((30, (6, 8)))
+            self.assertEqual(len(split_collection), 1)
+            self.assertEqual(split_collection.fps, 30)
+            self.assertEqual(split_collection.image_size, (6, 8))
 
 
 if __name__ == "__main__":

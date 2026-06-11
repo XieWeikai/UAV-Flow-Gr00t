@@ -3,11 +3,13 @@ from __future__ import annotations
 """Unreal Go2 episode -> LeRobot v2.1 转换入口。
 
 典型用法：
-    .\\.venv\\Scripts\\python.exe unreal.py ^
-        --raw_dir C:/Data/Saved/scene_0002/szt/episode_000000 ^
-        --output_dir ./tmp ^
-        --dataset_name unreal_go2_test ^
-        --num_processes 1
+    .\\.venv-py311\\Scripts\\python.exe unreal.py ^
+        --raw_dir F:/UnrealProject/Saved/scene_0004 ^
+        --output_dir ./tmp/saved_scene_0004_direct_output ^
+        --camera_keys front,rear,left,right ^
+        --num_processes 1 ^
+        --skip_invalid_episodes ^
+        --trim_extra_tail_frame
 
 `--raw_dir` 可传三种层级：
     1. UE OutputRoot，例如 C:/Data/Saved
@@ -20,12 +22,28 @@ from __future__ import annotations
 如果输入根目录混有旧格式或不完整 episode，可加 `--skip_invalid_episodes`
 跳过不兼容条目。转换报告会写入 `meta/unreal_conversion_report.json`，其中记录
 已准备提交、实际成功落盘、失败或跳过的 episode。
+`--output_dir` 直接作为总输出目录；默认按 scene 分组，每个 scene 目录内
+包含一份标准 LeRobot 数据集和额外 sidecar：
+    output/
+        scene_0001/
+            data/
+            meta/
+            videos/
+            episodes_extras.parquet
+            images/
+        scene_0002/
+            ...
+
 如果同一个 raw_dir 中混有多套 fps/分辨率，可加 `--split_by_schema`，脚本会按
-`sample_rate_hz + capture_height + capture_width` 拆成多个 LeRobot 数据集，例如：
-    output/3d_simu_ue_pointnav_fps10_720x1280
-    output/3d_simu_ue_pointnav_fps30_480x640
-拆分模式下还会额外写出总报告：
-    output/3d_simu_ue_pointnav_conversion_report.json
+`sample_rate_hz + capture_height + capture_width` 再拆一层 schema 目录，例如：
+    output/
+        fps10_480x640/
+            scene_0001/
+        fps30_720x1280/
+            scene_0001/
+转换总报告写入：
+    output/unreal_conversion_report.json
+
 如果旧数据存在“frames.jsonl 比 episode_meta.frame_count 多 1 行”的半帧问题，可加
 `--trim_extra_tail_frame`。脚本只会在最后一行 frame_index 正好等于 frame_count 时，
 在内存中裁掉最后一行，不会修改原始 episode 文件。
@@ -43,6 +61,11 @@ from __future__ import annotations
     meta/episodes_extras.jsonl
     data/chunk-000/episode_*.parquet
     videos/chunk-000/video.<camera>/episode_*.mp4
+scene 目录下还会额外写出：
+    episodes_extras.parquet  # 每条 episode 一行，含 K_<camera>、Extrinsic_<camera> 等
+    images/chunk-000/observation.depth.<camera>/episode_*/00000.png
+        # 如果原始 depth/<camera>/*.png 存在，会复制为 depth sidecar；
+        # 缺失 depth 不影响 LeRobot 主数据转换，会记录在转换报告中。
 
 每帧 parquet 字段：
     annotation.human.action.task_description
@@ -66,22 +89,17 @@ import argparse
 import csv
 import json
 import logging
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import cv2
 import numpy as np
+import pandas as pd
 from PIL import Image
 from scipy.spatial.transform import Rotation
-
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
-from utils.coordinate import homogeneous_inv
-from utils.lerobot.lerobot_creater import LeRobotCreator
-from utils.rgb_pose_dataset import select_video_pixel_format, transform_to_pose_vector
 
 TASK_DESCRIPTION_KEY = "annotation.human.action.task_description"
 STATE_KEY = "observation.state"
@@ -107,8 +125,13 @@ UE_CAMERA_FROM_OPENCV = np.array(
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert Unreal Go2 recording episodes to LeRobot v2.1 format.")
     parser.add_argument("--raw_dir", type=str, required=True, help="UE OutputRoot, scene/user dir, or one episode_* dir.")
-    parser.add_argument("--output_dir", type=str, default=".", help="Directory used to store the exported dataset.")
-    parser.add_argument("--dataset_name", type=str, default=None, help="LeRobot dataset directory name.")
+    parser.add_argument("--output_dir", type=str, default=".", help="Directory used to store scene-grouped exported datasets.")
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="Deprecated. Kept for CLI compatibility; scene-grouped output uses output_dir directly.",
+    )
     parser.add_argument("--camera_keys", type=str, default=",".join(DEFAULT_CAMERA_KEYS), help="Comma-separated cameras to export.")
     parser.add_argument("--num_processes", type=int, default=8, help="Number of writer worker processes.")
     parser.add_argument("--codec", type=str, default="h264", choices=["h264", "hevc", "libsvtav1"], help="Video codec.")
@@ -173,6 +196,14 @@ def load_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in file if line.strip()]
 
 
+def path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        logging.warning("Path existence check failed, treating as missing: %s (%s)", path, exc)
+        return False
+
+
 def scan_episode_dirs(raw_dir: str | Path) -> list[Path]:
     root = Path(raw_dir)
     if not root.exists():
@@ -218,6 +249,49 @@ def episode_schema(meta: dict[str, Any]) -> tuple[int, tuple[int, int]]:
 def schema_suffix(schema: tuple[int, tuple[int, int]]) -> str:
     fps, (height, width) = schema
     return f"fps{fps}_{height}x{width}"
+
+
+def normalize_quaternion_xyzw(quaternion: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(quaternion)
+    if norm <= 0:
+        raise ValueError("Quaternion norm must be positive.")
+    quaternion = quaternion / norm
+    if quaternion[3] < 0:
+        quaternion = -quaternion
+    return quaternion.astype(np.float32)
+
+
+def transform_to_pose_vector(transform: Any) -> np.ndarray:
+    transform = np.asarray(transform, dtype=np.float32)
+    if transform.shape != (4, 4):
+        raise ValueError(f"transform must have shape (4, 4), got {transform.shape}")
+    translation = transform[:3, 3]
+    quaternion = normalize_quaternion_xyzw(Rotation.from_matrix(transform[:3, :3]).as_quat().astype(np.float32))
+    return np.concatenate([translation, quaternion], axis=0).astype(np.float32)
+
+
+def select_video_pixel_format(image_size: tuple[int, int], codec: str, pix_fmt: str) -> str:
+    if pix_fmt != "auto":
+        return pix_fmt
+    if codec in {"h264", "hevc"} and any(size % 2 != 0 for size in image_size):
+        logging.warning(
+            "Image size %s is not divisible by 2, using yuv444p to keep the original resolution.",
+            image_size,
+        )
+        return "yuv444p"
+    return "yuv420p"
+
+
+def homogeneous_inv(transform: np.ndarray) -> np.ndarray:
+    transform = np.asarray(transform)
+    if transform.shape != (4, 4):
+        raise ValueError(f"Expected shape (4, 4), got {transform.shape}")
+    inverse = np.eye(4, dtype=transform.dtype)
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    inverse[:3, :3] = rotation.T
+    inverse[:3, 3] = -(rotation.T @ translation)
+    return inverse
 
 
 def unreal_pose_to_target_transform(pose: list[float] | np.ndarray) -> np.ndarray:
@@ -268,6 +342,18 @@ def intrinsic_4(frame_or_meta: dict[str, Any], camera_key: str) -> list[float]:
     if len(matrix) != 9:
         raise ValueError(f"{key} must contain 9 values, got {len(matrix)}")
     return [float(matrix[0]), float(matrix[4]), float(matrix[2]), float(matrix[5])]
+
+
+def intrinsic_matrix(frame_or_meta: dict[str, Any], camera_key: str) -> list[list[float]]:
+    """从 UE 写出的 3x3 K 展平数组中恢复完整内参矩阵。"""
+    key = f"K_{camera_key}"
+    if key not in frame_or_meta:
+        raise ValueError(f"Missing {key}")
+    matrix = frame_or_meta[key]
+    if len(matrix) != 9:
+        raise ValueError(f"{key} must contain 9 values, got {len(matrix)}")
+    values = [float(value) for value in matrix]
+    return [values[0:3], values[3:6], values[6:9]]
 
 
 def rotation_delta_deg(a: np.ndarray, b: np.ndarray) -> float:
@@ -357,7 +443,9 @@ class CameraImageSource:
         video_candidates.append(episode_dir / "rgb" / f"{camera_key}.mp4")
 
         for candidate in video_candidates:
-            if candidate.exists():
+            if path_exists(candidate):
+                import cv2
+
                 video_path = candidate
                 capture = cv2.VideoCapture(str(video_path))
                 try:
@@ -385,6 +473,8 @@ class CameraImageSource:
 
     def iter_rgb(self):
         if self.video_path is not None:
+            import cv2
+
             capture = cv2.VideoCapture(str(self.video_path))
             if not capture.isOpened():
                 raise ValueError(f"Failed to open video: {self.video_path}")
@@ -442,6 +532,10 @@ class UnrealEpisode:
             "original_episode_index": int(self.meta.get("episode_index", -1)),
             "map_name": self.meta.get("map_name", ""),
             "frame_count": len(self.frames),
+            "fps": int(round(float(self.meta.get("sample_rate_hz", 0)))),
+            "capture_width": int(self.meta.get("capture_width", 0)),
+            "capture_height": int(self.meta.get("capture_height", 0)),
+            "camera_keys": self.camera_keys,
             "task": self.task,
             "task_info": self.task_info,
         }
@@ -449,6 +543,8 @@ class UnrealEpisode:
             video_key = f"video.{camera}"
             metadata[f"{video_key}.K"] = intrinsic_4(self.frames[0], camera)
             metadata[f"{video_key}.body_from_camera"] = self.body_from_camera[camera]
+            metadata[f"K_{camera}"] = intrinsic_matrix(self.frames[0], camera)
+            metadata[f"Extrinsic_{camera}"] = self.body_from_camera[camera]
         return metadata
 
     def __iter__(self):
@@ -699,6 +795,27 @@ class UnrealEpisodeCollection:
             initial_exclusions=[],
         )
 
+    def for_episodes(
+        self,
+        episodes: list[tuple],
+        *,
+        target_schema: tuple[int, tuple[int, int]] | None = None,
+    ) -> "UnrealEpisodeCollection":
+        return UnrealEpisodeCollection(
+            raw_dir=self.raw_dir,
+            camera_keys=self.camera_keys,
+            get_task_idx=self.get_task_idx,
+            translation_tolerance_m=self.translation_tolerance_m,
+            rotation_tolerance_deg=self.rotation_tolerance_deg,
+            skip_invalid_episodes=True,
+            target_schema=target_schema,
+            trim_extra_tail_frame=self.trim_extra_tail_frame,
+            initial_episodes=episodes,
+            initial_failures=[],
+            initial_repairs=[],
+            initial_exclusions=[],
+        )
+
     def __len__(self) -> int:
         return len(self.episodes)
 
@@ -797,6 +914,8 @@ def write_conversion_report(root: Path, report: dict[str, Any]):
 
 
 def validate_lerobot_dataset(repo_id: str, root: str | Path):
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
     meta = LeRobotDatasetMetadata(repo_id, root=root)
     if meta.total_episodes == 0:
         raise ValueError("Number of episodes is 0.")
@@ -808,6 +927,138 @@ def validate_lerobot_dataset(repo_id: str, root: str | Path):
             video_path = meta.root / meta.get_video_file_path(episode_index, video_key)
             if not video_path.exists():
                 raise ValueError(f"Video file is missing: {video_path}")
+
+
+def normalize_parquet_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return json.dumps(value.tolist(), ensure_ascii=False, default=json_default)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, default=json_default)
+    return value
+
+
+def write_episode_extras_parquet(root: Path) -> dict[str, Any]:
+    extras_path = root / "meta" / "episodes_extras.jsonl"
+    rows = load_jsonl_dicts(extras_path)
+    output_path = root / "episodes_extras.parquet"
+    if not rows:
+        return {
+            "status": "skipped",
+            "reason": "missing_or_empty_episodes_extras_jsonl",
+            "source": str(extras_path),
+            "output": str(output_path),
+            "num_rows": 0,
+        }
+
+    normalized_rows = [
+        {key: normalize_parquet_value(value) for key, value in row.items()}
+        for row in rows
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(normalized_rows).to_parquet(output_path, index=False)
+    return {
+        "status": "completed",
+        "source": str(extras_path),
+        "output": str(output_path),
+        "num_rows": len(normalized_rows),
+    }
+
+
+def copy_depth_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
+    extras_path = root / "meta" / "episodes_extras.jsonl"
+    extras = load_jsonl_dicts(extras_path)
+    report: dict[str, Any] = {
+        "status": "completed",
+        "source": str(extras_path),
+        "output_root": str(root / "images"),
+        "num_episodes": len(extras),
+        "num_copied_files": 0,
+        "missing": [],
+    }
+    if not extras:
+        report["status"] = "skipped"
+        report["reason"] = "missing_or_empty_episodes_extras_jsonl"
+        return report
+
+    for item in extras:
+        source_episode_path = item.get("source_episode_path")
+        episode_index = item.get("episode_index")
+        if source_episode_path in (None, "") or episode_index is None:
+            report["missing"].append(
+                {
+                    "source_episode_path": source_episode_path or "",
+                    "episode_index": episode_index,
+                    "reason": "missing_source_or_episode_index",
+                }
+            )
+            continue
+
+        episode_dir = Path(str(source_episode_path))
+        chunk = int(episode_index) // 1000
+        for camera in camera_keys:
+            source_dir = episode_dir / "depth" / camera
+            if not source_dir.exists():
+                report["missing"].append(
+                    {
+                        "source_episode_path": str(episode_dir),
+                        "episode_index": int(episode_index),
+                        "camera": camera,
+                        "reason": "missing_depth_dir",
+                    }
+                )
+                continue
+
+            depth_paths = sorted(source_dir.glob("*.png"))
+            if not depth_paths:
+                report["missing"].append(
+                    {
+                        "source_episode_path": str(episode_dir),
+                        "episode_index": int(episode_index),
+                        "camera": camera,
+                        "reason": "empty_depth_dir",
+                    }
+                )
+                continue
+
+            target_dir = (
+                root
+                / "images"
+                / f"chunk-{chunk:03d}"
+                / f"observation.depth.{camera}"
+                / f"episode_{int(episode_index):06d}"
+            )
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for frame_index, source_path in enumerate(depth_paths):
+                shutil.copy2(source_path, target_dir / f"{frame_index:05d}.png")
+                report["num_copied_files"] += 1
+
+    if report["missing"]:
+        report["status"] = "completed_with_missing_depth"
+    return report
+
+
+def write_scene_sidecars(root: Path, camera_keys: list[str]) -> dict[str, Any]:
+    return {
+        "episodes_extras_parquet": write_episode_extras_parquet(root),
+        "depth_sidecars": copy_depth_sidecars(root, camera_keys),
+    }
+
+
+def group_episodes_by_scene(episodes: list[tuple]) -> dict[str, list[tuple]]:
+    groups: dict[str, list[tuple]] = {}
+    for episode in episodes:
+        episode_dir = episode[0]
+        scene_id, _user_id = infer_source_ids(episode_dir)
+        groups.setdefault(scene_id or "unknown_scene", []).append(episode)
+    return groups
+
+
+def group_episodes_by_schema(episodes: list[tuple]) -> dict[tuple[int, tuple[int, int]], list[tuple]]:
+    groups: dict[tuple[int, tuple[int, int]], list[tuple]] = {}
+    for episode in episodes:
+        schema = episode_schema(episode[1])
+        groups.setdefault(schema, []).append(episode)
+    return groups
 
 
 def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name: str, args, started_at: str) -> dict[str, Any]:
@@ -826,6 +1077,8 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
     resolved_pix_fmt = select_video_pixel_format(collection.image_size, codec=args.codec, pix_fmt=args.pix_fmt)
     logging.info("Using fps=%s image_size=%s pix_fmt=%s", collection.fps, collection.image_size, resolved_pix_fmt)
 
+    from utils.lerobot.lerobot_creater import LeRobotCreator
+
     creator = LeRobotCreator(
         root=str(root),
         robot_type=UnrealEpisodeCollection.ROBOT_TYPE,
@@ -841,6 +1094,7 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
 
     start_time = time.time()
     status = "failed"
+    sidecar_report: dict[str, Any] = {}
     try:
         for episode_index, episode in enumerate(collection, start=1):
             logging.info("Submitting episode %s / %s: %s", episode_index, len(collection), episode.episode_dir)
@@ -850,18 +1104,24 @@ def run_conversion(collection: UnrealEpisodeCollection, root: Path, dataset_name
         creator.wait()
         logging.info("Reading written episode metadata from %s", root / "meta" / "episodes_extras.jsonl")
         collection.sync_successful_episodes_from_output(root)
+        sidecar_report = write_scene_sidecars(root, collection.camera_keys)
         logging.info("Validating generated LeRobot dataset at %s", root)
         validate_lerobot_dataset(repo_id=dataset_name, root=root)
         status = "completed"
     finally:
         if status != "completed":
             collection.sync_successful_episodes_from_output(root)
+            if not sidecar_report:
+                sidecar_report = write_scene_sidecars(root, collection.camera_keys)
         completed_at = utc_now_iso()
         report = collection.build_report(root, started_at, completed_at, status)
+        report["sidecars"] = sidecar_report
         write_conversion_report(root, report)
 
     logging.info("Done! %d episodes in %.2fs -> %s", len(collection.successful_episodes), time.time() - start_time, root)
-    return collection.build_report(root, started_at, utc_now_iso(), status)
+    report = collection.build_report(root, started_at, utc_now_iso(), status)
+    report["sidecars"] = sidecar_report
+    return report
 
 
 def main():
@@ -871,11 +1131,11 @@ def main():
     raw_dir = Path(args.raw_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_name = args.dataset_name or raw_dir.name
-    root = output_dir / dataset_name
     camera_keys = parse_camera_keys(args.camera_keys)
     started_at = utc_now_iso()
-    logging.info("Starting Unreal conversion raw_dir=%s output=%s dataset=%s cameras=%s", raw_dir, root, dataset_name, camera_keys)
+    if args.dataset_name:
+        logging.warning("--dataset_name is deprecated for Unreal scene-grouped export and will be ignored.")
+    logging.info("Starting Unreal conversion raw_dir=%s output_dir=%s cameras=%s", raw_dir, output_dir, camera_keys)
 
     collection = UnrealEpisodeCollection(
         raw_dir=raw_dir,
@@ -888,35 +1148,40 @@ def main():
         trim_extra_tail_frame=args.trim_extra_tail_frame,
     )
 
-    if not args.split_by_schema:
-        run_conversion(collection, root, dataset_name, args, started_at)
-        return
-
-    if not collection.schema_groups:
+    if not collection.schema_valid_episodes:
         completed_at = utc_now_iso()
-        report = collection.build_report(root, started_at, completed_at, "no_valid_episodes")
-        write_conversion_report(root, report)
+        report = collection.build_report(output_dir, started_at, completed_at, "no_valid_episodes")
+        write_json(output_dir / "unreal_conversion_report.json", report)
         raise ValueError(f"No schema-compatible Unreal episodes found under {raw_dir}")
 
-    logging.info("Splitting by schema into %d LeRobot datasets", len(collection.schema_groups))
+    schema_groups = group_episodes_by_schema(collection.schema_valid_episodes) if args.split_by_schema else {None: collection.schema_valid_episodes}
     group_reports: list[dict[str, Any]] = []
     group_errors: list[dict[str, str]] = []
-    for group in sorted(collection.schema_groups.values(), key=lambda item: item["schema_key"]):
-        schema = (int(group["fps"]), tuple(group["image_size"]))
-        group_dataset_name = f"{dataset_name}_{group['schema_key']}"
-        group_root = output_dir / group_dataset_name
-        logging.info(
-            "Converting schema %s -> %s (%d episodes)",
-            group["schema_key"],
-            group_root,
-            group["num_episodes"],
-        )
-        group_collection = collection.for_schema(schema)
-        try:
-            group_reports.append(run_conversion(group_collection, group_root, group_dataset_name, args, started_at))
-        except Exception as exc:
-            logging.exception("Schema conversion failed for %s", group["schema_key"])
-            group_errors.append({"schema_key": group["schema_key"], "error": str(exc)})
+    for schema, schema_episodes in sorted(
+        schema_groups.items(),
+        key=lambda item: schema_suffix(item[0]) if item[0] is not None else "",
+    ):
+        schema_key = schema_suffix(schema) if schema is not None else ""
+        scene_groups = group_episodes_by_scene(schema_episodes)
+        for scene_id, scene_episodes in sorted(scene_groups.items()):
+            scene_root = output_dir / schema_key / scene_id if schema_key else output_dir / scene_id
+            scene_dataset_name = f"{schema_key}_{scene_id}" if schema_key else scene_id
+            logging.info(
+                "Converting scene=%s schema=%s -> %s (%d episodes)",
+                scene_id,
+                schema_key or "default",
+                scene_root,
+                len(scene_episodes),
+            )
+            scene_collection = collection.for_episodes(scene_episodes, target_schema=schema)
+            try:
+                report = run_conversion(scene_collection, scene_root, scene_dataset_name, args, started_at)
+                report["scene_id"] = scene_id
+                report["schema_key"] = schema_key
+                group_reports.append(report)
+            except Exception as exc:
+                logging.exception("Scene conversion failed for scene=%s schema=%s", scene_id, schema_key or "default")
+                group_errors.append({"scene_id": scene_id, "schema_key": schema_key, "error": str(exc)})
 
     completed_at = utc_now_iso()
     top_report = {
@@ -925,7 +1190,6 @@ def main():
         "completed_at": completed_at,
         "raw_dir": str(raw_dir),
         "output_dir": str(output_dir),
-        "dataset_name": dataset_name,
         "camera_keys": camera_keys,
         "schema_groups": list(collection.schema_groups.values()),
         "group_reports": group_reports,
@@ -933,12 +1197,12 @@ def main():
         "scan_failures": collection.failed_episodes,
         "repaired_episodes": collection.repaired_episodes,
     }
-    top_report_path = output_dir / f"{dataset_name}_conversion_report.json"
+    top_report_path = output_dir / "unreal_conversion_report.json"
     write_json(top_report_path, top_report)
-    logging.info("Wrote split conversion report: %s", top_report_path)
+    logging.info("Wrote conversion report: %s", top_report_path)
 
     if group_errors and not group_reports:
-        raise RuntimeError(f"All schema conversions failed; see {top_report_path}")
+        raise RuntimeError(f"All scene conversions failed; see {top_report_path}")
 
 
 if __name__ == "__main__":

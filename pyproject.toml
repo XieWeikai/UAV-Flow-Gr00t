@@ -33,5 +33,6 @@ dev = [
     "jupyterlab>=4.4.9",
     "notebook>=7.4.7",
     "py-spy>=0.4.1",
+    "pytest>=9.1.1",
     "scipy>=1.15.3",
 ]

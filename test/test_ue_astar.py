@@ -145,6 +145,7 @@ class UEAStarConversionTests(unittest.TestCase):
                 path.write_text("{}", encoding="utf-8")
 
             self.assertEqual(scan_astar_episode_dirs(root), [episode_dir])
+            self.assertEqual(scan_astar_episode_dirs(root / "data"), [episode_dir])
             self.assertEqual(scan_astar_episode_dirs(episode_dir), [episode_dir])
 
     def test_compute_map_pixel_4096_matches_collection_examples(self):

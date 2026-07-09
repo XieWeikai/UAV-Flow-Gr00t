@@ -2,14 +2,15 @@ from __future__ import annotations
 
 """Unreal A* episode -> LeRobot v2.1 conversion entry.
 
-Typical input root is a worker collection directory such as:
+Typical input root is a worker collection data directory such as:
 
-    /mnt/glx/pointnav_collect/worker_01
+    /mnt/glx/pointnav_collect/worker_01/data
 
-The converter only scans the `data/` subtree under that root and writes one
-standard LeRobot dataset at `--output_dir`. It keeps the standard Unreal
-training fields (`observation.state`, `action`, RGB videos and episode extras)
-and adds generic map-grounding fields:
+Passing the worker root remains supported for compatibility; in that case the
+converter scans only its `data/` child. It writes one standard LeRobot dataset
+at `--output_dir`. It keeps the standard Unreal training fields
+(`observation.state`, `action`, RGB videos and episode extras) and adds generic
+map-grounding fields:
 
     observation.map.grid_cell   # [x, y, layer], int32, invalid [-1, -1, -1]
     observation.map.pixel_4096  # [x, y], int32, invalid [-1, -1]
@@ -85,7 +86,7 @@ def parse_args():
         "--raw_dir",
         type=str,
         required=True,
-        help="Worker collection root, data subtree, scene/run directory, or one episode_* directory.",
+        help="Collection data directory (for example .../worker_01/data), worker root, scene/run directory, or one episode_* directory.",
     )
     parser.add_argument("--output_dir", type=str, default=".", help="Directory used to store the exported LeRobot dataset.")
     parser.add_argument(
@@ -131,13 +132,8 @@ def write_jsonl_dicts(path: Path, rows: list[dict[str, Any]]):
             file.write("\n")
 
 
-def scan_astar_episode_dirs(raw_dir: str | Path) -> list[Path]:
-    """Find episode directories, preferring the collection `data/` subtree.
-
-    The worker root also contains traversability/task bookkeeping. Those files
-    are inputs for metadata lookup, not episode roots, so scanning is limited to
-    `data/` whenever that child exists.
-    """
+def resolve_astar_episode_search_root(raw_dir: str | Path) -> Path:
+    """Resolve the subtree that should be scanned for episode directories."""
 
     root = Path(raw_dir)
     if not root.exists():
@@ -146,9 +142,25 @@ def scan_astar_episode_dirs(raw_dir: str | Path) -> list[Path]:
         raise ValueError(f"raw_dir must be a directory: {root}")
 
     if (root / "episode_meta.json").exists():
-        return [root]
+        return root
 
-    search_root = root / "data" if (root / "data").is_dir() else root
+    if root.name == "data":
+        return root
+
+    return root / "data" if (root / "data").is_dir() else root
+
+
+def scan_astar_episode_dirs(raw_dir: str | Path) -> list[Path]:
+    """Find episode directories.
+
+    Preferred input is the collection `data/` directory. The worker root also
+    remains accepted; because it contains traversability/task bookkeeping, only
+    its `data/` child is scanned when present.
+    """
+
+    search_root = resolve_astar_episode_search_root(raw_dir)
+    if (search_root / "episode_meta.json").exists():
+        return [search_root]
     return sorted(path.parent for path in search_root.rglob("episode_meta.json"))
 
 

@@ -4876,7 +4876,11 @@ dependencies = [
     { name = "numpy", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "open3d" },
     { name = "opencv-python" },
+    { name = "pandas" },
     { name = "pillow" },
+    { name = "pyarrow" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tqdm" },
 ]
 
@@ -4891,8 +4895,6 @@ dev = [
     { name = "notebook" },
     { name = "py-spy" },
     { name = "pytest" },
-    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scipy", version = "1.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.metadata]
@@ -4904,7 +4906,10 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "open3d", specifier = ">=0.19.0" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
+    { name = "pandas", specifier = ">=2.3.2" },
     { name = "pillow", specifier = ">=11.3.0" },
+    { name = "pyarrow", specifier = ">=21.0.0" },
+    { name = "scipy", specifier = ">=1.15.3" },
     { name = "tqdm", specifier = ">=4.67.1" },
 ]
 
@@ -4919,7 +4924,6 @@ dev = [
     { name = "notebook", specifier = ">=7.4.7" },
     { name = "py-spy", specifier = ">=0.4.1" },
     { name = "pytest", specifier = ">=9.1.1" },
-    { name = "scipy", specifier = ">=1.15.3" },
 ]
 
 [[package]]

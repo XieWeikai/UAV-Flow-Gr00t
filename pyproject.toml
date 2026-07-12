@@ -12,7 +12,10 @@ dependencies = [
     "numpy>=2.2.6",
     "open3d>=0.19.0",
     "opencv-python>=4.11.0.86",
+    "pandas>=2.3.2",
     "pillow>=11.3.0",
+    "pyarrow>=21.0.0",
+    "scipy>=1.15.3",
     "tqdm>=4.67.1",
 ]
 
@@ -20,8 +23,8 @@ dependencies = [
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["utils"]
+[tool.setuptools.packages.find]
+include = ["utils*"]
 
 [dependency-groups]
 base = [
@@ -34,5 +37,4 @@ dev = [
     "notebook>=7.4.7",
     "py-spy>=0.4.1",
     "pytest>=9.1.1",
-    "scipy>=1.15.3",
 ]

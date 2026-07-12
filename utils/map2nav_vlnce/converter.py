@@ -1,0 +1,807 @@
+"""Manifest-driven Map2Nav VLN-CE replay conversion."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
+from .assets import project_world_positions, resolve_map_bundle
+from .coordinates import habitat_poses_to_xnav
+from .filtering import FloorEligibility, SourceSchemaError, classify_floor_levels
+from .schema import (
+    DEFAULT_TASK,
+    MAP_ASSET_KEYS,
+    RGB_VIEW_MAP,
+    SCHEMA_VERSION,
+    VideoInfo,
+    build_features,
+    build_modality,
+    numeric_stats,
+    write_episode_parquet,
+)
+
+
+@dataclass(frozen=True)
+class SourceEpisode:
+    manifest_index: int
+    episode_dir: Path
+    episode_dir_relative: str
+    trajectory_id: str
+    scene_key: str
+    eligibility: FloorEligibility
+    length: int
+
+
+def convert_dataset(
+    input_root: str | Path,
+    output_root: str | Path,
+    dataset_name: str,
+    split: str,
+    max_episodes: int | None = None,
+    chunk_size: int = 1000,
+    resume: bool = False,
+    overwrite: bool = False,
+    num_workers: int = 1,
+    skip_preflight: bool = False,
+) -> Path:
+    """Convert one replay split into stable Map2Nav VLN-CE data."""
+
+    if resume and overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if num_workers <= 0:
+        raise ValueError("num_workers must be positive")
+    if max_episodes is not None and max_episodes <= 0:
+        raise ValueError("max_episodes must be positive when provided")
+    if split not in {"train", "val_seen", "val_unseen"}:
+        raise ValueError(f"unsupported split: {split!r}")
+    if dataset_name not in {"r2r", "rxr_guide"}:
+        raise ValueError(f"unsupported dataset_name: {dataset_name!r}")
+
+    input_root = Path(input_root).resolve()
+    output_root = Path(output_root).resolve()
+    split_root = input_root / split
+    dataset_root = output_root / split
+    preexisting_output = dataset_root.exists()
+    if preexisting_output and not overwrite and not resume:
+        raise FileExistsError(
+            f"output split already exists: {dataset_root}; use --resume or --overwrite"
+        )
+    context_path = dataset_root / "meta" / ".conversion" / "context.json"
+    conversion_context = {
+        "schema_version": SCHEMA_VERSION,
+        "input_root": str(input_root),
+        "dataset_name": dataset_name,
+        "split": split,
+        "chunk_size": chunk_size,
+        "copy_mode": "copy2",
+    }
+    if preexisting_output and resume and context_path.is_file():
+        existing_context = _read_json(context_path)
+        for key, value in conversion_context.items():
+            if existing_context.get(key) != value:
+                raise SourceSchemaError(
+                    f"resume context mismatch for {key}: "
+                    f"{existing_context.get(key)!r}, expected {value!r}"
+                )
+    elif preexisting_output and resume and any(dataset_root.iterdir()):
+        raise SourceSchemaError(
+            f"cannot resume non-empty output without conversion context: {dataset_root}"
+        )
+
+    candidates = (
+        _scan_manifest_fast(split_root, dataset_name=dataset_name, split=split)
+        if skip_preflight
+        else _scan_source(split_root, dataset_name=dataset_name, split=split)
+    )
+    single_floor = [candidate for candidate in candidates if candidate.eligibility.accepted]
+    selected = single_floor[:max_episodes]
+    skipped = [candidate for candidate in candidates if not candidate.eligibility.accepted]
+
+    if preexisting_output and overwrite:
+        shutil.rmtree(dataset_root)
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    if not context_path.is_file():
+        _write_json_atomic(context_path, conversion_context)
+    journal_root = dataset_root / "meta" / ".conversion" / "episodes"
+    journal_root.mkdir(parents=True, exist_ok=True)
+    if resume:
+        completed_indices = [
+            int(path.stem.removeprefix("episode_"))
+            for path in journal_root.glob("episode_*.json")
+        ]
+        if completed_indices and max(completed_indices) >= len(selected):
+            raise SourceSchemaError(
+                "max_episodes is smaller than the existing completed episode journal; "
+                "resume may expand a conversion but cannot shrink it"
+            )
+    staging_root = dataset_root / ".staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    jobs: list[tuple[int, SourceEpisode, int]] = []
+    global_frame_start = 0
+    for episode_index, candidate in enumerate(selected):
+        jobs.append((episode_index, candidate, global_frame_start))
+        global_frame_start += candidate.length
+
+    fragments: list[dict[str, Any]] = []
+    expected_video: VideoInfo | None = None
+    progress = tqdm(total=len(jobs), desc=f"Converting {dataset_name}/{split}", unit="episode")
+
+    def process(job: tuple[int, SourceEpisode, int]) -> tuple[dict[str, Any], bool]:
+        episode_index, candidate, frame_start = job
+        fragment_path = journal_root / f"episode_{episode_index:06d}.json"
+        if resume and fragment_path.is_file():
+            fragment = _read_json(fragment_path)
+            _validate_resume_fragment(
+                fragment,
+                dataset_root=dataset_root,
+                candidate=candidate,
+                episode_index=episode_index,
+                global_frame_start=frame_start,
+            )
+            return fragment, False
+        _remove_episode_outputs(dataset_root, episode_index, chunk_size)
+        fragment = _convert_episode(
+            split_root=split_root,
+            dataset_root=dataset_root,
+            staging_root=staging_root,
+            candidate=candidate,
+            dataset_name=dataset_name,
+            split=split,
+            episode_index=episode_index,
+            task_index=0,
+            global_frame_start=frame_start,
+            chunk_size=chunk_size,
+        )
+        return fragment, True
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            future_to_index = {
+                executor.submit(process, job): job[0]
+                for job in jobs
+            }
+            for future in as_completed(future_to_index):
+                fragment, newly_converted = future.result()
+                episode_index = int(fragment["episode_index"])
+                if newly_converted:
+                    fragment_path = journal_root / f"episode_{episode_index:06d}.json"
+                    _write_json_atomic(fragment_path, fragment)
+
+                video = VideoInfo(**fragment["video_info"])
+                if expected_video is None:
+                    expected_video = video
+                elif video != expected_video:
+                    raise SourceSchemaError(
+                        f"video metadata differs across accepted episodes: "
+                        f"{expected_video} vs {video}"
+                    )
+                fragments.append(fragment)
+                progress.update(1)
+        fragments.sort(key=lambda fragment: int(fragment["episode_index"]))
+        for episode_index, fragment in enumerate(fragments):
+            if int(fragment["episode_index"]) != episode_index:
+                raise SourceSchemaError("conversion produced non-contiguous episode indices")
+            if int(fragment["global_frame_start"]) != jobs[episode_index][2]:
+                raise SourceSchemaError("conversion produced an incorrect global frame offset")
+    except Exception as exc:
+        _write_json_atomic(
+            dataset_root / "meta" / "conversion_error.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "dataset_name": dataset_name,
+                "split": split,
+                "accepted_before_error": len(fragments),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        raise
+    finally:
+        progress.close()
+
+    if expected_video is None:
+        raise SourceSchemaError(f"no eligible episode selected for {dataset_name}/{split}")
+    _write_final_metadata(
+        dataset_root=dataset_root,
+        dataset_name=dataset_name,
+        split=split,
+        chunk_size=chunk_size,
+        video=expected_video,
+        fragments=fragments,
+        candidates=candidates,
+        single_floor=single_floor,
+        skipped=skipped,
+        max_episodes=max_episodes,
+        num_workers=num_workers,
+    )
+    shutil.rmtree(staging_root, ignore_errors=True)
+    error_path = dataset_root / "meta" / "conversion_error.json"
+    if error_path.exists():
+        error_path.unlink()
+    return dataset_root
+
+
+def _scan_source(split_root: Path, *, dataset_name: str, split: str) -> list[SourceEpisode]:
+    manifest_path = split_root / "manifest.jsonl"
+    errors_path = split_root / "errors.jsonl"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing replay manifest: {manifest_path}")
+    if not errors_path.is_file():
+        raise FileNotFoundError(f"missing replay errors file: {errors_path}")
+    source_errors = _read_jsonl(errors_path)
+    if source_errors:
+        raise SourceSchemaError(
+            f"source replay has {len(source_errors)} recorded errors: {errors_path}"
+        )
+    manifest = _read_jsonl(manifest_path)
+    if not manifest:
+        raise SourceSchemaError(f"empty replay manifest: {manifest_path}")
+
+    expected_dataset, expected_role = (
+        ("r2r", None) if dataset_name == "r2r" else ("rxr", "guide")
+    )
+    candidates: list[SourceEpisode] = []
+    iterator = tqdm(manifest, desc=f"Preflight {dataset_name}/{split}", unit="episode")
+    for manifest_index, row in enumerate(iterator):
+        if row.get("dataset") != expected_dataset or row.get("role") != expected_role:
+            raise SourceSchemaError(
+                f"manifest row {manifest_index} dataset/role mismatch: "
+                f"{row.get('dataset')!r}/{row.get('role')!r}"
+            )
+        if row.get("split") != split:
+            raise SourceSchemaError(
+                f"manifest row {manifest_index} split mismatch: {row.get('split')!r}"
+            )
+        relative = row.get("episode_dir")
+        episode_dir = _safe_source_path(split_root, relative)
+        episode = _read_json(episode_dir / "episode.json")
+        steps = _read_jsonl(episode_dir / "steps.jsonl")
+        _validate_episode_identity(row, episode, manifest_index)
+        _validate_steps(steps, episode=episode, manifest=row, source_dir=episode_dir)
+        eligibility = classify_floor_levels(steps)
+        candidates.append(
+            SourceEpisode(
+                manifest_index=manifest_index,
+                episode_dir=episode_dir,
+                episode_dir_relative=str(relative),
+                trajectory_id=str(episode.get("trajectory_id", "")),
+                scene_key=str(episode.get("scene_key", "")),
+                eligibility=eligibility,
+                length=len(steps),
+            )
+        )
+    return candidates
+
+
+def _scan_manifest_fast(
+    split_root: Path, *, dataset_name: str, split: str
+) -> list[SourceEpisode]:
+    """Build conversion jobs from manifest/episode metadata without step preflight.
+
+    Conversion still reads and validates each selected steps file in
+    ``_convert_episode``. This mode only avoids the separate full source scan;
+    it is intended for trusted, already inspected replay roots.
+    """
+    manifest_path = split_root / "manifest.jsonl"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing replay manifest: {manifest_path}")
+    manifest = _read_jsonl(manifest_path)
+    if not manifest:
+        raise SourceSchemaError(f"empty replay manifest: {manifest_path}")
+    expected_dataset, expected_role = (
+        ("r2r", None) if dataset_name == "r2r" else ("rxr", "guide")
+    )
+    candidates: list[SourceEpisode] = []
+    for manifest_index, row in enumerate(manifest):
+        if row.get("dataset") != expected_dataset or row.get("role") != expected_role:
+            raise SourceSchemaError(
+                f"manifest row {manifest_index} dataset/role mismatch: "
+                f"{row.get('dataset')!r}/{row.get('role')!r}"
+            )
+        if row.get("split") != split:
+            raise SourceSchemaError(
+                f"manifest row {manifest_index} split mismatch: {row.get('split')!r}"
+            )
+        relative = row.get("episode_dir")
+        episode_dir = _safe_source_path(split_root, relative)
+        overlay_paths = row.get("overlay_paths", [])
+        level_ids = tuple(
+            sorted(
+                {
+                    int(match.group(1))
+                    for path in overlay_paths
+                    if (match := re.search(r"(?:layout|detail)_level_(\d+)", str(path)))
+                }
+            )
+        )
+        if not level_ids:
+            raise SourceSchemaError(f"manifest has no floor overlay levels: {episode_dir}")
+        eligibility = FloorEligibility(
+            accepted=len(level_ids) == 1,
+            source_level_id=level_ids[0] if len(level_ids) == 1 else None,
+            visited_levels=level_ids,
+            reason=None if len(level_ids) == 1 else "multi_floor",
+        )
+        length = int(row.get("num_steps", 0))
+        if length <= 0:
+            raise SourceSchemaError(f"episode has invalid num_steps: {episode_dir}")
+        candidates.append(
+            SourceEpisode(
+                manifest_index=manifest_index,
+                episode_dir=episode_dir,
+                episode_dir_relative=str(relative),
+                trajectory_id=str(row.get("trajectory_id", "")),
+                scene_key=str(row.get("scene_key", "")),
+                eligibility=eligibility,
+                length=length,
+            )
+        )
+    return candidates
+
+
+def _convert_episode(
+    *,
+    split_root: Path,
+    dataset_root: Path,
+    staging_root: Path,
+    candidate: SourceEpisode,
+    dataset_name: str,
+    split: str,
+    episode_index: int,
+    task_index: int,
+    global_frame_start: int,
+    chunk_size: int,
+) -> dict[str, Any]:
+    episode = _read_json(candidate.episode_dir / "episode.json")
+    steps = _read_jsonl(candidate.episode_dir / "steps.jsonl")
+    eligibility = classify_floor_levels(steps)
+    if not eligibility.accepted or eligibility.source_level_id is None:
+        raise SourceSchemaError(
+            f"accepted source episode changed floor eligibility: {candidate.episode_dir}"
+        )
+    _validate_steps(steps, episode=episode, manifest=None, source_dir=candidate.episode_dir)
+    bundle = resolve_map_bundle(split_root, episode, eligibility.source_level_id)
+    positions = np.asarray([step["position"] for step in steps], dtype=np.float64)
+    rotations = np.asarray([step["rotation"] for step in steps], dtype=np.float64)
+    source_pixels = np.asarray([step["floorplan_xy"] for step in steps], dtype=np.int32)
+    projected = project_world_positions(positions, bundle.projection, rounded=True)
+    max_projection_error = int(np.abs(projected - source_pixels).max(initial=0))
+    if max_projection_error > 1:
+        raise SourceSchemaError(
+            f"floorplan projection differs by {max_projection_error}px: {candidate.episode_dir}"
+        )
+
+    video = _video_info(episode, candidate.episode_dir)
+    states = habitat_poses_to_xnav(positions, rotations)
+    rows, stats = _build_rows(
+        steps=steps,
+        states=states,
+        positions=positions,
+        rotations=rotations,
+        episode_index=episode_index,
+        task_index=task_index,
+        global_frame_start=global_frame_start,
+        fps=video.fps,
+    )
+
+    chunk = episode_index // chunk_size
+    episode_name = f"episode_{episode_index:06d}"
+    stage = staging_root / episode_name
+    shutil.rmtree(stage, ignore_errors=True)
+    staged_files: dict[str, Path] = {}
+    parquet_relative = Path("data") / f"chunk-{chunk:03d}" / f"{episode_name}.parquet"
+    stage.mkdir(parents=True, exist_ok=True)
+    parquet_stage = stage / "episode.parquet"
+    write_episode_parquet(parquet_stage, rows)
+    staged_files[parquet_relative.as_posix()] = parquet_stage
+
+    for source_view, output_view in RGB_VIEW_MAP.items():
+        source = candidate.episode_dir / f"{source_view}.mp4"
+        relative = (
+            Path("videos")
+            / f"chunk-{chunk:03d}"
+            / f"video.{output_view}"
+            / f"{episode_name}.mp4"
+        )
+        stage_path = stage / f"video.{output_view}.mp4"
+        _copy_file(source, stage_path)
+        staged_files[relative.as_posix()] = stage_path
+
+    map_assets: dict[str, str] = {}
+    for key in MAP_ASSET_KEYS:
+        relative = Path("maps") / f"chunk-{chunk:03d}" / episode_name / f"{key}.png"
+        stage_path = stage / f"map.{key}.png"
+        _copy_file(bundle.sources[key], stage_path)
+        staged_files[relative.as_posix()] = stage_path
+        map_assets[key] = relative.as_posix()
+
+    _validate_staged_episode(staged_files, expected_rows=len(rows))
+    for parent in {str((dataset_root / relative).parent) for relative in staged_files}:
+        Path(parent).mkdir(parents=True, exist_ok=True)
+    for relative, source in staged_files.items():
+        target = dataset_root / relative
+        os.replace(source, target)
+    stage.rmdir()
+
+    instructions = episode.get("instructions", [])
+    if not isinstance(instructions, list):
+        raise SourceSchemaError(f"instructions must be a list: {candidate.episode_dir}")
+    extras = {
+        "schema_version": SCHEMA_VERSION,
+        "episode_index": episode_index,
+        "dataset_name": dataset_name,
+        "role": episode.get("role"),
+        "split": split,
+        "trajectory_id": str(episode.get("trajectory_id", "")),
+        "scene_key": str(episode.get("scene_key", "")),
+        "source_episode_ids": [str(value) for value in episode.get("episode_ids", [])],
+        "source_episode_dir": candidate.episode_dir_relative,
+        "instructions": instructions,
+        "video": {
+            "width": video.width,
+            "height": video.height,
+            "fps": video.fps,
+            "hfov": video.hfov,
+            "source_view_order": list(episode.get("video_views", [])),
+        },
+        "map_size": [bundle.height, bundle.width],
+        "map_projection": bundle.projection,
+        "map_assets": map_assets,
+    }
+    return {
+        "source_manifest_index": candidate.manifest_index,
+        "source_episode_dir": candidate.episode_dir_relative,
+        "episode_index": episode_index,
+        "global_frame_start": global_frame_start,
+        "length": len(rows),
+        "video_info": {
+            "width": video.width,
+            "height": video.height,
+            "fps": video.fps,
+            "hfov": video.hfov,
+        },
+        "output_files": list(staged_files),
+        "episode": {
+            "episode_index": episode_index,
+            "tasks": [DEFAULT_TASK],
+            "length": len(rows),
+        },
+        "stats": {"episode_index": episode_index, "stats": stats},
+        "extras": extras,
+    }
+
+
+def _build_rows(
+    *,
+    steps: list[dict[str, Any]],
+    states: np.ndarray,
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    episode_index: int,
+    task_index: int,
+    global_frame_start: int,
+    fps: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw_positions = positions.astype(np.float32)
+    raw_rotations = rotations.astype(np.float32)
+    floorplan = np.asarray([step["floorplan_xy"] for step in steps], dtype=np.int32)
+    discrete = np.asarray(
+        [int(step["discrete_action_to_next_id"]) for step in steps], dtype=np.int32
+    ).reshape(-1, 1)
+    rows: list[dict[str, Any]] = []
+    for frame_index in range(len(steps)):
+        state = states[frame_index].tolist()
+        rows.append(
+            {
+                "annotation.human.action.task_description": [task_index],
+                "observation.state": state,
+                "action": list(state),
+                "frame_index": frame_index,
+                "timestamp": np.float32(frame_index / fps).item(),
+                "index": global_frame_start + frame_index,
+                "episode_index": episode_index,
+                "task_index": task_index,
+                "extra.habitat_world_position": raw_positions[frame_index].tolist(),
+                "extra.habitat_world_rotation_xyzw": raw_rotations[frame_index].tolist(),
+                "extra.floorplan_xy": floorplan[frame_index].tolist(),
+                "extra.discrete_action_to_next_id": discrete[frame_index].tolist(),
+                "extra.cot": "",
+            }
+        )
+    stats = numeric_stats(
+        {
+            "observation.state": states,
+            "action": states,
+            "extra.habitat_world_position": raw_positions,
+            "extra.habitat_world_rotation_xyzw": raw_rotations,
+            "extra.floorplan_xy": floorplan,
+            "extra.discrete_action_to_next_id": discrete,
+        }
+    )
+    return rows, stats
+
+
+def _write_final_metadata(
+    *,
+    dataset_root: Path,
+    dataset_name: str,
+    split: str,
+    chunk_size: int,
+    video: VideoInfo,
+    fragments: list[dict[str, Any]],
+    candidates: list[SourceEpisode],
+    single_floor: list[SourceEpisode],
+    skipped: list[SourceEpisode],
+    max_episodes: int | None,
+    num_workers: int,
+) -> None:
+    meta = dataset_root / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    total_episodes = len(fragments)
+    total_frames = sum(int(fragment["length"]) for fragment in fragments)
+    info = {
+        "codebase_version": "v2.1",
+        "robot_type": "map2nav_vlnce",
+        "schema_version": SCHEMA_VERSION,
+        "fps": video.fps,
+        "total_episodes": total_episodes,
+        "total_frames": total_frames,
+        "total_tasks": 1,
+        "total_videos": total_episodes * len(RGB_VIEW_MAP),
+        "total_chunks": math.ceil(total_episodes / chunk_size),
+        "chunks_size": chunk_size,
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": (
+            "videos/chunk-{episode_chunk:03d}/{video_key}/"
+            "episode_{episode_index:06d}.mp4"
+        ),
+        "features": build_features(video),
+        "splits": {split: f"0:{total_episodes}"},
+    }
+    _write_json_atomic(meta / "info.json", info)
+    _write_jsonl_atomic(meta / "tasks.jsonl", [{"task_index": 0, "task": DEFAULT_TASK}])
+    _write_jsonl_atomic(meta / "episodes.jsonl", [fragment["episode"] for fragment in fragments])
+    _write_jsonl_atomic(meta / "episodes_stats.jsonl", [fragment["stats"] for fragment in fragments])
+    _write_jsonl_atomic(meta / "episodes_extras.jsonl", [fragment["extras"] for fragment in fragments])
+    _write_jsonl_atomic(
+        meta / "skipped_episodes.jsonl",
+        [
+            {
+                "source_manifest_index": candidate.manifest_index,
+                "source_episode_dir": candidate.episode_dir_relative,
+                "trajectory_id": candidate.trajectory_id,
+                "scene_key": candidate.scene_key,
+                "reason": "multi_floor",
+                "visited_levels": list(candidate.eligibility.visited_levels),
+            }
+            for candidate in skipped
+        ],
+    )
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_name": dataset_name,
+        "split": split,
+        "copy_mode": "copy2",
+        "source_manifest_total": len(candidates),
+        "eligible_single_floor": len(single_floor),
+        "accepted": total_episodes,
+        "accepted_frames": total_frames,
+        "skipped_multi_floor": len(skipped),
+        "unconverted_single_floor_due_to_limit": len(single_floor) - total_episodes,
+        "errors": 0,
+        "max_episodes": max_episodes,
+        "num_workers": num_workers,
+        "complete_source_conversion": max_episodes is None,
+    }
+    _write_json_atomic(meta / "conversion_report.json", report)
+    _write_json_atomic(meta / "modality.json", build_modality())
+
+
+def _validate_steps(
+    steps: list[dict[str, Any]],
+    *,
+    episode: dict[str, Any],
+    manifest: dict[str, Any] | None,
+    source_dir: Path,
+) -> None:
+    if not steps:
+        raise SourceSchemaError(f"empty steps.jsonl: {source_dir}")
+    expected = len(steps)
+    for source, label in ((episode, "episode.json"), (manifest, "manifest")):
+        if source is None:
+            continue
+        for key in ("num_steps", "num_frames"):
+            if int(source.get(key, -1)) != expected:
+                raise SourceSchemaError(
+                    f"{label} {key} does not match steps ({expected}): {source_dir}"
+                )
+    for index, step in enumerate(steps):
+        if int(step.get("step_index", -1)) != index:
+            raise SourceSchemaError(f"non-contiguous step_index at {source_dir} frame {index}")
+        if int(step.get("video_frame_index", -1)) != index:
+            raise SourceSchemaError(f"video_frame_index mismatch at {source_dir} frame {index}")
+        position = np.asarray(step.get("position"), dtype=np.float64)
+        rotation = np.asarray(step.get("rotation"), dtype=np.float64)
+        floorplan = np.asarray(step.get("floorplan_xy"))
+        if position.shape != (3,) or rotation.shape != (4,) or floorplan.shape != (2,):
+            raise SourceSchemaError(f"invalid pose/floorplan shape at {source_dir} frame {index}")
+        if not np.all(np.isfinite(position)) or not np.all(np.isfinite(rotation)):
+            raise SourceSchemaError(f"non-finite pose at {source_dir} frame {index}")
+        if np.linalg.norm(rotation) <= 0.0:
+            raise SourceSchemaError(f"zero-norm quaternion at {source_dir} frame {index}")
+        if step.get("map_xy") != step.get("graph_xy") or step.get("map_xy") != step.get(
+            "floorplan_xy"
+        ):
+            raise SourceSchemaError(f"unaligned map coordinates at {source_dir} frame {index}")
+        action_id = int(step.get("discrete_action_to_next_id", -1))
+        if action_id not in {0, 1, 2, 3}:
+            raise SourceSchemaError(f"invalid discrete action at {source_dir} frame {index}")
+    if int(steps[-1].get("discrete_action_to_next_id", -1)) != 0:
+        raise SourceSchemaError(f"terminal frame is not STOP: {source_dir}")
+
+
+def _validate_episode_identity(
+    manifest: dict[str, Any], episode: dict[str, Any], manifest_index: int
+) -> None:
+    for key in ("dataset", "role", "split", "trajectory_id", "scene_key", "episode_ids"):
+        if manifest.get(key) != episode.get(key):
+            raise SourceSchemaError(
+                f"manifest row {manifest_index} disagrees with episode.json for {key!r}"
+            )
+
+
+def _video_info(episode: dict[str, Any], source_dir: Path) -> VideoInfo:
+    try:
+        video = VideoInfo(
+            width=int(episode["video_width"]),
+            height=int(episode["video_height"]),
+            fps=int(episode["video_fps"]),
+            hfov=float(episode["video_hfov"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SourceSchemaError(f"invalid video metadata: {source_dir}") from exc
+    if video.width <= 0 or video.height <= 0 or video.fps <= 0:
+        raise SourceSchemaError(f"invalid video dimensions/fps: {source_dir}")
+    return video
+
+
+def _copy_file(source: Path, target: Path) -> None:
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise SourceSchemaError(f"missing or empty source asset: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    if target.stat().st_size != source.stat().st_size:
+        raise OSError(f"copied file size mismatch: {source} -> {target}")
+
+
+def _validate_staged_episode(staged_files: dict[str, Path], *, expected_rows: int) -> None:
+    for path in staged_files.values():
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise OSError(f"staged output is missing or empty: {path}")
+    parquet = next(
+        path for relative, path in staged_files.items() if relative.endswith(".parquet")
+    )
+    if pq.read_metadata(parquet).num_rows != expected_rows:
+        raise OSError(f"staged parquet row count mismatch: {parquet}")
+
+
+def _validate_resume_fragment(
+    fragment: dict[str, Any],
+    *,
+    dataset_root: Path,
+    candidate: SourceEpisode,
+    episode_index: int,
+    global_frame_start: int,
+) -> None:
+    expected = {
+        "source_manifest_index": candidate.manifest_index,
+        "source_episode_dir": candidate.episode_dir_relative,
+        "episode_index": episode_index,
+        "global_frame_start": global_frame_start,
+        "length": candidate.length,
+    }
+    for key, value in expected.items():
+        if fragment.get(key) != value:
+            raise SourceSchemaError(
+                f"resume journal mismatch for episode {episode_index}: {key}={fragment.get(key)!r}, "
+                f"expected {value!r}"
+            )
+    for relative in fragment.get("output_files", []):
+        path = dataset_root / relative
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise SourceSchemaError(f"resume output missing or empty: {path}")
+
+
+def _remove_episode_outputs(dataset_root: Path, episode_index: int, chunk_size: int) -> None:
+    chunk = episode_index // chunk_size
+    name = f"episode_{episode_index:06d}"
+    paths = [dataset_root / "data" / f"chunk-{chunk:03d}" / f"{name}.parquet"]
+    paths.extend(
+        dataset_root
+        / "videos"
+        / f"chunk-{chunk:03d}"
+        / f"video.{view}"
+        / f"{name}.mp4"
+        for view in RGB_VIEW_MAP.values()
+    )
+    paths.append(dataset_root / "maps" / f"chunk-{chunk:03d}" / name)
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+
+def _safe_source_path(root: Path, raw: Any) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise SourceSchemaError(f"invalid episode_dir in manifest: {raw!r}")
+    resolved_root = root.resolve()
+    path = (resolved_root / raw).resolve()
+    try:
+        path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise SourceSchemaError(f"episode_dir escapes split root: {raw!r}") from exc
+    if not path.is_dir():
+        raise SourceSchemaError(f"missing episode directory: {path}")
+    return path
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SourceSchemaError(f"cannot read JSON object: {path}") from exc
+    if not isinstance(value, dict):
+        raise SourceSchemaError(f"JSON value must be an object: {path}")
+    return value
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise SourceSchemaError(f"JSONL row is not an object: {path}:{line_number}")
+                rows.append(value)
+    except SourceSchemaError:
+        raise
+    except Exception as exc:
+        raise SourceSchemaError(f"cannot read JSONL: {path}") from exc
+    return rows
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)

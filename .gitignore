@@ -25,3 +25,4 @@ test/*_visual*
 test/obstacle*
 debug**/*
 **/*.log
+local/

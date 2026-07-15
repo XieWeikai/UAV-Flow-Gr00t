@@ -15,6 +15,11 @@ map-grounding fields:
     observation.map.grid_cell   # [x, y, layer], int32, invalid [-1, -1, -1]
     observation.map.pixel_4096  # [x, y], int32, invalid [-1, -1]
 
+`--instruction_type` is required. `pointnav` preserves the task_info.csv task,
+`vln` keeps only episodes with a non-empty VLN instruction, and `objectnav`
+keeps only episodes with a non-empty ObjectNav instruction. ObjectNav tasks are
+JSON strings containing `task` and `target_category`; VLN tasks are plain text.
+
 Map assets are copied as dataset sidecars:
 
     maps/chunk-000/planned_path_map/episode_000000.png
@@ -31,6 +36,7 @@ import json
 import logging
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -94,6 +100,13 @@ def parse_args():
         type=str,
         default=None,
         help="Optional dataset/repo name used for validation metadata. Defaults to output_dir name.",
+    )
+    parser.add_argument(
+        "--instruction_type",
+        type=str,
+        required=True,
+        choices=["pointnav", "vln", "objectnav"],
+        help="Task source: legacy task_info.csv, VLN instruction, or ObjectNav instruction.",
     )
     parser.add_argument("--camera_keys", type=str, default=",".join(DEFAULT_CAMERA_KEYS), help="Comma-separated cameras to export.")
     parser.add_argument("--num_processes", type=int, default=8, help="Number of writer worker processes.")
@@ -162,6 +175,53 @@ def scan_astar_episode_dirs(raw_dir: str | Path) -> list[Path]:
     if (search_root / "episode_meta.json").exists():
         return [search_root]
     return sorted(path.parent for path in search_root.rglob("episode_meta.json"))
+
+
+def _clean_instruction_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def load_navigation_instruction(episode_dir: Path) -> dict[str, Any] | None:
+    """Load and normalize the optional navigation instruction annotation."""
+
+    path = episode_dir / "instruction.json"
+    if not path.exists():
+        return None
+
+    payload = load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"instruction.json must contain an object: {path}")
+
+    vln = payload.get("vln") if isinstance(payload.get("vln"), dict) else {}
+    objectnav = payload.get("objectnav") if isinstance(payload.get("objectnav"), dict) else {}
+    return {
+        "has_quality_issue": payload.get("has_quality_issue") is True,
+        "quality_reason": _clean_instruction_text(payload.get("quality_reason")),
+        "vln_instruction": _clean_instruction_text(vln.get("instruction")),
+        "objectnav_instruction": _clean_instruction_text(objectnav.get("instruction")),
+        "objectnav_target_category": _clean_instruction_text(objectnav.get("target_category")),
+    }
+
+
+def build_instruction_task(annotation: dict[str, Any], instruction_type: str) -> str | None:
+    """Build the LeRobot task string for one instruction mode."""
+
+    if instruction_type == "vln":
+        return annotation.get("vln_instruction") or None
+    if instruction_type == "objectnav":
+        instruction = annotation.get("objectnav_instruction") or ""
+        if not instruction:
+            return None
+        return json.dumps(
+            {
+                "task": instruction,
+                "target_category": annotation.get("objectnav_target_category") or "",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    raise ValueError(f"Unsupported instruction_type for instruction task: {instruction_type}")
 
 
 def build_astar_features(image_size: tuple[int, int], camera_keys: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -384,6 +444,7 @@ class AStarEpisode(UnrealEpisode):
         task_info: list[dict[str, Any]],
         body_from_camera: dict[str, np.ndarray],
         astar_context: dict[str, Any],
+        instruction_type: str = "pointnav",
     ):
         self.episode_dir = episode_dir
         self.meta = meta
@@ -392,6 +453,7 @@ class AStarEpisode(UnrealEpisode):
         self.task = task
         self.task_idx = task_idx
         self.task_info = task_info
+        self.instruction_type = instruction_type
         self.body_from_camera = body_from_camera
         self.astar_context = normalize_astar_context(astar_context)
         self.graph = self.astar_context["graph"]
@@ -405,6 +467,9 @@ class AStarEpisode(UnrealEpisode):
     def metadata(self) -> dict[str, Any]:
         scene_id, run_id = infer_source_ids(self.episode_dir)
         map_width, map_height = compute_map_size_4096(self.graph)
+        metadata_task = self.task
+        if self.instruction_type == "objectnav":
+            metadata_task = _clean_instruction_text(json.loads(self.task).get("task"))
         metadata: dict[str, Any] = {
             "source_episode_path": str(self.episode_dir),
             "scene_id": scene_id,
@@ -417,7 +482,7 @@ class AStarEpisode(UnrealEpisode):
             "capture_width": int(self.meta.get("capture_width", 0)),
             "capture_height": int(self.meta.get("capture_height", 0)),
             "camera_keys": self.camera_keys,
-            "task": self.task,
+            "task": metadata_task,
             "task_info": self.task_info,
             "task.task_uid": extract_astar_value(self.astar_context, "task_uid"),
             "task.path_uid": extract_astar_value(self.astar_context, "path_uid"),
@@ -466,9 +531,43 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
     INSTRUCTION_KEY = TASK_DESCRIPTION_KEY
 
     def __init__(self, *args, **kwargs):
+        self.instruction_type = kwargs.pop("instruction_type", "pointnav")
+        if self.instruction_type not in {"pointnav", "vln", "objectnav"}:
+            raise ValueError(f"Unsupported instruction_type: {self.instruction_type}")
         super().__init__(*args, **kwargs)
         if self.episodes:
             self.FEATURES = build_astar_features(self.image_size, self.camera_keys)
+
+    def _record_instruction_exclusion(
+        self,
+        episode_dir: Path,
+        reason: str,
+        *,
+        quality_reason: str = "",
+    ):
+        exclusion = {
+            "source_episode_path": str(episode_dir),
+            "stage": "instruction_filter",
+            "reason": reason,
+        }
+        if quality_reason:
+            exclusion["quality_reason"] = quality_reason
+        self.excluded_episodes.append(exclusion)
+        logging.info("Excluding A* episode during instruction filtering (%s): %s", reason, episode_dir)
+
+    def build_report(self, root: Path, started_at: str, completed_at: str | None, status: str) -> dict[str, Any]:
+        report = super().build_report(root, started_at, completed_at, status)
+        report["instruction_type"] = self.instruction_type
+        report["instruction_filter_counts"] = dict(
+            sorted(
+                Counter(
+                    item["reason"]
+                    for item in self.excluded_episodes
+                    if item.get("stage") == "instruction_filter"
+                ).items()
+            )
+        )
+        return report
 
     def _load_episodes(self):
         loaded = []
@@ -480,6 +579,27 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             meta_path = episode_dir / "episode_meta.json"
             frames_path = episode_dir / "frames.jsonl"
             try:
+                selected_task: str | None = None
+                if self.instruction_type != "pointnav":
+                    annotation = load_navigation_instruction(episode_dir)
+                    if annotation is None:
+                        self._record_instruction_exclusion(episode_dir, "missing_instruction_file")
+                        continue
+                    if annotation["has_quality_issue"]:
+                        self._record_instruction_exclusion(
+                            episode_dir,
+                            "instruction_quality_issue",
+                            quality_reason=annotation["quality_reason"],
+                        )
+                        continue
+                    selected_task = build_instruction_task(annotation, self.instruction_type)
+                    if selected_task is None:
+                        self._record_instruction_exclusion(
+                            episode_dir,
+                            f"missing_{self.instruction_type}_instruction",
+                        )
+                        continue
+
                 if not frames_path.exists():
                     raise ValueError("missing frames.jsonl")
                 meta = load_json(meta_path)
@@ -508,7 +628,8 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
                             raise ValueError(f"missing K_{camera} in frame {frame.get('frame_index')} and episode_meta.json")
 
                 astar_context = load_astar_context(episode_dir)
-                task, task_info = load_task_info(episode_dir)
+                pointnav_task, task_info = load_task_info(episode_dir)
+                task = pointnav_task if self.instruction_type == "pointnav" else selected_task
                 logging.info("Validating fixed camera extrinsics for %s", episode_dir)
                 body_from_camera = validate_fixed_extrinsics(
                     episode_dir,
@@ -538,10 +659,11 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             skip_invalid_episodes=True,
             target_schema=schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
+            instruction_type=self.instruction_type,
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
-            initial_exclusions=[],
+            initial_exclusions=self.excluded_episodes,
         )
 
     def for_episodes(
@@ -559,10 +681,11 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             skip_invalid_episodes=True,
             target_schema=target_schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
+            instruction_type=self.instruction_type,
             initial_episodes=episodes,
             initial_failures=[],
             initial_repairs=[],
-            initial_exclusions=[],
+            initial_exclusions=self.excluded_episodes,
         )
 
     def __iter__(self):
@@ -579,6 +702,7 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
                     task_info=task_info,
                     body_from_camera=episode_context["body_from_camera"],
                     astar_context=episode_context["astar_context"],
+                    instruction_type=self.instruction_type,
                 )
             except Exception as exc:
                 self._record_failure(episode_dir, "episode_prepare", exc)
@@ -912,9 +1036,10 @@ def main():
     camera_keys = parse_camera_keys(args.camera_keys)
     started_at = utc_now_iso()
     logging.info(
-        "Starting A* conversion raw_dir=%s output_dir=%s cameras=%s include_depth=%s",
+        "Starting A* conversion raw_dir=%s output_dir=%s instruction_type=%s cameras=%s include_depth=%s",
         raw_dir,
         output_dir,
+        args.instruction_type,
         camera_keys,
         args.include_depth,
     )
@@ -928,6 +1053,7 @@ def main():
         skip_invalid_episodes=args.skip_invalid_episodes,
         keep_all_schemas=args.split_by_schema,
         trim_extra_tail_frame=args.trim_extra_tail_frame,
+        instruction_type=args.instruction_type,
     )
 
     if not collection.schema_valid_episodes:
@@ -968,6 +1094,7 @@ def main():
         "raw_dir": str(raw_dir),
         "output_dir": str(output_dir),
         "camera_keys": camera_keys,
+        "instruction_type": args.instruction_type,
         "schema_groups": list(collection.schema_groups.values()),
         "group_reports": group_reports,
         "group_errors": group_errors,

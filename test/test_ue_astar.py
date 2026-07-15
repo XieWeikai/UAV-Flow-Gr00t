@@ -13,12 +13,14 @@ from ue_astar import (
     MAP_PIXEL_4096_KEY,
     AStarEpisode,
     AStarEpisodeCollection,
+    build_instruction_task,
     build_astar_features,
     build_map_frame_fields,
     build_output_groups,
     compute_map_pixel_4096,
     copy_astar_map_sidecars,
     copy_depth_sidecars_limited,
+    load_navigation_instruction,
     scan_astar_episode_dirs,
     write_astar_dataset_sidecars,
 )
@@ -131,6 +133,116 @@ def write_astar_episode(
 
 
 class UEAStarConversionTests(unittest.TestCase):
+    def test_load_navigation_instruction_normalizes_nested_fields(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_instruction_") as tmp:
+            episode_dir = Path(tmp)
+            payload = {
+                "has_quality_issue": False,
+                "quality_reason": None,
+                "vln": {"instruction": "  Walk to the desk.  "},
+                "objectnav": {
+                    "instruction": "  Find the chair.  ",
+                    "target_category": "  chair  ",
+                },
+            }
+            (episode_dir / "instruction.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            annotation = load_navigation_instruction(episode_dir)
+
+            self.assertEqual(
+                annotation,
+                {
+                    "has_quality_issue": False,
+                    "quality_reason": "",
+                    "vln_instruction": "Walk to the desk.",
+                    "objectnav_instruction": "Find the chair.",
+                    "objectnav_target_category": "chair",
+                },
+            )
+
+    def test_load_navigation_instruction_returns_none_when_file_is_missing(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_instruction_") as tmp:
+            self.assertIsNone(load_navigation_instruction(Path(tmp)))
+
+    def test_build_instruction_task_uses_mode_specific_schema(self):
+        annotation = {
+            "vln_instruction": "Walk to the desk.",
+            "objectnav_instruction": "Find the chair.",
+            "objectnav_target_category": "chair",
+        }
+
+        self.assertEqual(build_instruction_task(annotation, "vln"), "Walk to the desk.")
+        objectnav_task = build_instruction_task(annotation, "objectnav")
+        self.assertEqual(
+            json.loads(objectnav_task),
+            {"task": "Find the chair.", "target_category": "chair"},
+        )
+        self.assertNotIn("vln_instruction", objectnav_task)
+        self.assertNotIn("objectnav_instruction", objectnav_task)
+
+    def test_build_instruction_task_returns_none_for_empty_selected_instruction(self):
+        annotation = {
+            "vln_instruction": "",
+            "objectnav_instruction": "",
+            "objectnav_target_category": "chair",
+        }
+
+        self.assertIsNone(build_instruction_task(annotation, "vln"))
+        self.assertIsNone(build_instruction_task(annotation, "objectnav"))
+
+    def test_quality_issue_is_excluded_before_frames_are_loaded(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_instruction_") as tmp:
+            root = Path(tmp)
+            episode_dir = root / "data" / "scene" / "run" / "episode_000000"
+            episode_dir.mkdir(parents=True)
+            (episode_dir / "episode_meta.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+            (episode_dir / "instruction.json").write_text(
+                json.dumps({"has_quality_issue": True, "quality_reason": "blurred"}),
+                encoding="utf-8",
+            )
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="vln",
+            )
+
+            self.assertEqual(collection.failed_episodes, [])
+            self.assertEqual(len(collection.excluded_episodes), 1)
+            self.assertEqual(collection.excluded_episodes[0]["reason"], "instruction_quality_issue")
+            self.assertEqual(collection.excluded_episodes[0]["quality_reason"], "blurred")
+
+    def test_instruction_report_includes_mode_and_filter_counts(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_instruction_") as tmp:
+            root = Path(tmp)
+            episode_dir = root / "data" / "scene" / "run" / "episode_000000"
+            episode_dir.mkdir(parents=True)
+            (episode_dir / "episode_meta.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="objectnav",
+            )
+            report = collection.build_report(root, "start", "end", "no_valid_episodes")
+
+            self.assertEqual(report["instruction_type"], "objectnav")
+            self.assertEqual(report["instruction_filter_counts"], {"missing_instruction_file": 1})
+
     def test_scan_astar_episode_dirs_reads_data_tree_only(self):
         with tempfile.TemporaryDirectory(prefix="ue_astar_episode_") as tmp:
             root = Path(tmp)
@@ -213,6 +325,26 @@ class UEAStarConversionTests(unittest.TestCase):
             self.assertEqual(metadata["maps.long_edge_px"], 4096)
             self.assertEqual(metadata["maps.width_4096"], 4096)
             self.assertEqual(metadata["maps.height_4096"], 2731)
+
+            objectnav_task = json.dumps(
+                {"task": "Find the chair.", "target_category": "chair"},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            objectnav_episode = AStarEpisode(
+                episode_dir=episode_dir,
+                meta=meta,
+                frames=frames,
+                camera_keys=["front"],
+                task=objectnav_task,
+                task_idx=0,
+                task_info=[],
+                body_from_camera=body_from_camera,
+                astar_context=astar_context,
+                instruction_type="objectnav",
+            )
+            self.assertEqual(objectnav_episode.metadata["task"], "Find the chair.")
+            self.assertNotIn("target_category", objectnav_episode.metadata["task"])
 
     def test_collection_can_trim_one_extra_tail_frame(self):
         with tempfile.TemporaryDirectory(prefix="ue_astar_episode_") as tmp:

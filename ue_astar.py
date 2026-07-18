@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Unreal A* episode -> LeRobot v2.1 conversion entry.
 
 Typical input root is a worker collection data directory such as:
@@ -30,6 +28,8 @@ Map assets are copied as dataset sidecars:
 Depth PNG sidecars are optional and disabled by default. Pass `--include_depth`
 to copy them under `images/chunk-000/observation.depth.<camera>/...`.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -107,6 +107,12 @@ def parse_args():
         required=True,
         choices=["pointnav", "vln", "objectnav"],
         help="Task source: legacy task_info.csv, VLN instruction, or ObjectNav instruction.",
+    )
+    parser.add_argument(
+        "--evaluation_split",
+        choices=["val_seen", "val_unseen"],
+        default=None,
+        help="Optional evaluation split. val_unseen also filters episodes using val_unseen.txt.",
     )
     parser.add_argument("--camera_keys", type=str, default=",".join(DEFAULT_CAMERA_KEYS), help="Comma-separated cameras to export.")
     parser.add_argument("--num_processes", type=int, default=8, help="Number of writer worker processes.")
@@ -534,9 +540,52 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
         self.instruction_type = kwargs.pop("instruction_type", "pointnav")
         if self.instruction_type not in {"pointnav", "vln", "objectnav"}:
             raise ValueError(f"Unsupported instruction_type: {self.instruction_type}")
+        self.evaluation_split = kwargs.pop("evaluation_split", None)
+        if self.evaluation_split not in {None, "val_seen", "val_unseen"}:
+            raise ValueError(f"Unsupported evaluation_split: {self.evaluation_split}")
         super().__init__(*args, **kwargs)
         if self.episodes:
             self.FEATURES = build_astar_features(self.image_size, self.camera_keys)
+
+    def _record_evaluation_split_exclusion(
+        self,
+        episode_dir: Path,
+        reason: str,
+        *,
+        marker_task_types: list[str] | None = None,
+    ):
+        exclusion: dict[str, Any] = {
+            "source_episode_path": str(episode_dir),
+            "stage": "evaluation_split_filter",
+            "reason": reason,
+        }
+        if marker_task_types is not None:
+            exclusion["marker_task_types"] = marker_task_types
+        self.excluded_episodes.append(exclusion)
+        logging.info("Excluding A* episode during evaluation split filtering (%s): %s", reason, episode_dir)
+
+    def _matches_evaluation_split(self, episode_dir: Path) -> bool:
+        if self.evaluation_split != "val_unseen":
+            return True
+
+        marker_path = episode_dir / "val_unseen.txt"
+        if not marker_path.exists():
+            self._record_evaluation_split_exclusion(episode_dir, "missing_val_unseen_marker")
+            return False
+
+        marker_task_types = sorted(
+            line.strip().lower()
+            for line in marker_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if self.instruction_type not in marker_task_types:
+            self._record_evaluation_split_exclusion(
+                episode_dir,
+                "val_unseen_task_type_mismatch",
+                marker_task_types=marker_task_types,
+            )
+            return False
+        return True
 
     def _record_instruction_exclusion(
         self,
@@ -567,6 +616,17 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
                 ).items()
             )
         )
+        if self.evaluation_split is not None:
+            report["evaluation_split"] = self.evaluation_split
+            report["evaluation_split_filter_counts"] = dict(
+                sorted(
+                    Counter(
+                        item["reason"]
+                        for item in self.excluded_episodes
+                        if item.get("stage") == "evaluation_split_filter"
+                    ).items()
+                )
+            )
         return report
 
     def _load_episodes(self):
@@ -579,6 +639,9 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             meta_path = episode_dir / "episode_meta.json"
             frames_path = episode_dir / "frames.jsonl"
             try:
+                if not self._matches_evaluation_split(episode_dir):
+                    continue
+
                 selected_task: str | None = None
                 if self.instruction_type != "pointnav":
                     annotation = load_navigation_instruction(episode_dir)
@@ -660,6 +723,7 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             target_schema=schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
             instruction_type=self.instruction_type,
+            evaluation_split=self.evaluation_split,
             initial_episodes=self.schema_valid_episodes,
             initial_failures=self.failed_episodes,
             initial_repairs=self.repaired_episodes,
@@ -682,6 +746,7 @@ class AStarEpisodeCollection(UnrealEpisodeCollection):
             target_schema=target_schema,
             trim_extra_tail_frame=self.trim_extra_tail_frame,
             instruction_type=self.instruction_type,
+            evaluation_split=self.evaluation_split,
             initial_episodes=episodes,
             initial_failures=[],
             initial_repairs=[],
@@ -1036,10 +1101,11 @@ def main():
     camera_keys = parse_camera_keys(args.camera_keys)
     started_at = utc_now_iso()
     logging.info(
-        "Starting A* conversion raw_dir=%s output_dir=%s instruction_type=%s cameras=%s include_depth=%s",
+        "Starting A* conversion raw_dir=%s output_dir=%s instruction_type=%s evaluation_split=%s cameras=%s include_depth=%s",
         raw_dir,
         output_dir,
         args.instruction_type,
+        args.evaluation_split,
         camera_keys,
         args.include_depth,
     )
@@ -1054,6 +1120,7 @@ def main():
         keep_all_schemas=args.split_by_schema,
         trim_extra_tail_frame=args.trim_extra_tail_frame,
         instruction_type=args.instruction_type,
+        evaluation_split=args.evaluation_split,
     )
 
     if not collection.schema_valid_episodes:
@@ -1101,6 +1168,8 @@ def main():
         "scan_failures": collection.failed_episodes,
         "repaired_episodes": collection.repaired_episodes,
     }
+    if args.evaluation_split is not None:
+        top_report["evaluation_split"] = args.evaluation_split
     if args.split_by_schema:
         top_report_path = output_dir / "ue_astar_conversion_report.json"
         write_json(top_report_path, top_report)

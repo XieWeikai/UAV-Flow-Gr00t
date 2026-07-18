@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -21,6 +22,7 @@ from ue_astar import (
     copy_astar_map_sidecars,
     copy_depth_sidecars_limited,
     load_navigation_instruction,
+    parse_args,
     scan_astar_episode_dirs,
     write_astar_dataset_sidecars,
 )
@@ -132,7 +134,48 @@ def write_astar_episode(
     return episode_dir, meta, astar_payload
 
 
+def write_navigation_instruction(episode_dir: Path, *, vln: str = "", objectnav: str = "") -> None:
+    payload = {
+        "has_quality_issue": False,
+        "quality_reason": "",
+        "vln": {"instruction": vln} if vln else None,
+        "objectnav": {"instruction": objectnav, "target_category": "chair"} if objectnav else None,
+    }
+    (episode_dir / "instruction.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
 class UEAStarConversionTests(unittest.TestCase):
+    def test_ue_astar_test_script_builds_all_evaluation_outputs(self):
+        script_path = Path(__file__).parents[1] / "scripts" / "ue_astar_test.sh"
+
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('raw_root="/data/astarue/raw/test"', script)
+        self.assertIn('output_root="/data/astarue/processed/test"', script)
+        self.assertIn("for instruction_type in objectnav vln", script)
+        self.assertIn("for split in val_seen val_unseen", script)
+        self.assertIn('--raw_dir "${raw_root}/${split}"', script)
+        self.assertIn('--output_dir "${output_root}/${instruction_type}/${split}"', script)
+        self.assertIn('--evaluation_split "${split}"', script)
+        self.assertIn("--num_processes 32", script)
+
+    def test_parse_args_accepts_evaluation_split(self):
+        with patch(
+            "sys.argv",
+            [
+                "ue_astar.py",
+                "--raw_dir",
+                "/raw/val_unseen",
+                "--instruction_type",
+                "objectnav",
+                "--evaluation_split",
+                "val_unseen",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.evaluation_split, "val_unseen")
+
     def test_load_navigation_instruction_normalizes_nested_fields(self):
         with tempfile.TemporaryDirectory(prefix="ue_astar_instruction_") as tmp:
             episode_dir = Path(tmp)
@@ -242,6 +285,105 @@ class UEAStarConversionTests(unittest.TestCase):
 
             self.assertEqual(report["instruction_type"], "objectnav")
             self.assertEqual(report["instruction_filter_counts"], {"missing_instruction_file": 1})
+
+    def test_val_unseen_excludes_episode_without_marker_before_loading_frames(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_val_unseen_") as tmp:
+            root = Path(tmp)
+            episode_dir = root / "data" / "scene" / "run" / "episode_000000"
+            episode_dir.mkdir(parents=True)
+            (episode_dir / "episode_meta.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+            write_navigation_instruction(episode_dir, vln="Walk forward.")
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="vln",
+                evaluation_split="val_unseen",
+            )
+            report = collection.build_report(root, "start", "end", "no_valid_episodes")
+
+            self.assertEqual(collection.failed_episodes, [])
+            self.assertEqual(collection.excluded_episodes[0]["reason"], "missing_val_unseen_marker")
+            self.assertEqual(report["evaluation_split"], "val_unseen")
+            self.assertEqual(report["evaluation_split_filter_counts"], {"missing_val_unseen_marker": 1})
+
+    def test_val_unseen_excludes_objectnav_when_marker_only_lists_vln(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_val_unseen_") as tmp:
+            root = Path(tmp)
+            episode_dir = root / "data" / "scene" / "run" / "episode_000000"
+            episode_dir.mkdir(parents=True)
+            (episode_dir / "episode_meta.json").write_text(
+                json.dumps({"status": "completed"}),
+                encoding="utf-8",
+            )
+            write_navigation_instruction(episode_dir, objectnav="Find the chair.")
+            (episode_dir / "val_unseen.txt").write_text("pointnav\n vln \n", encoding="utf-8")
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="objectnav",
+                evaluation_split="val_unseen",
+            )
+
+            self.assertEqual(collection.failed_episodes, [])
+            self.assertEqual(collection.excluded_episodes[0]["reason"], "val_unseen_task_type_mismatch")
+            self.assertEqual(collection.excluded_episodes[0]["marker_task_types"], ["pointnav", "vln"])
+
+    def test_val_seen_accepts_instruction_without_marker(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_val_seen_") as tmp:
+            root = Path(tmp)
+            episode_dir, _, _ = write_astar_episode(root, [make_frame(0, 0.0, 100.0)])
+            write_navigation_instruction(episode_dir, vln="Walk forward.")
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="vln",
+                evaluation_split="val_seen",
+            )
+
+            self.assertEqual(len(collection), 1)
+            self.assertEqual(collection.excluded_episodes, [])
+
+    def test_val_unseen_accepts_objectnav_listed_in_marker(self):
+        with tempfile.TemporaryDirectory(prefix="ue_astar_val_unseen_") as tmp:
+            root = Path(tmp)
+            episode_dir, _, _ = write_astar_episode(root, [make_frame(0, 0.0, 100.0)])
+            write_navigation_instruction(episode_dir, objectnav="Find the chair.")
+            (episode_dir / "val_unseen.txt").write_text(
+                "pointnav\nvln\nobjectnav\n",
+                encoding="utf-8",
+            )
+
+            collection = AStarEpisodeCollection(
+                raw_dir=root,
+                camera_keys=["front"],
+                get_task_idx=lambda _task: 0,
+                translation_tolerance_m=1e-4,
+                rotation_tolerance_deg=0.1,
+                skip_invalid_episodes=True,
+                instruction_type="objectnav",
+                evaluation_split="val_unseen",
+            )
+
+            self.assertEqual(len(collection), 1)
+            self.assertEqual(collection.excluded_episodes, [])
 
     def test_scan_astar_episode_dirs_reads_data_tree_only(self):
         with tempfile.TemporaryDirectory(prefix="ue_astar_episode_") as tmp:

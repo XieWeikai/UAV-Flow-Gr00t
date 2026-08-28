@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +23,6 @@ from .assets import project_world_positions, resolve_map_bundle
 from .coordinates import habitat_poses_to_xnav
 from .filtering import FloorEligibility, SourceSchemaError, classify_floor_levels
 from .schema import (
-    DEFAULT_TASK,
     MAP_ASSET_KEYS,
     RGB_VIEW_MAP,
     SCHEMA_VERSION,
@@ -30,6 +32,16 @@ from .schema import (
     numeric_stats,
     write_episode_parquet,
 )
+
+RXR_ENGLISH_LANGUAGES = ("en-IN", "en-US")
+
+
+@dataclass(frozen=True)
+class SourceInstruction:
+    episode_id: str
+    trajectory_id: str
+    text: str
+    language: str | None
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,15 @@ class SourceEpisode:
     scene_key: str
     eligibility: FloorEligibility
     length: int
+    source_instruction_count: int
+    source_languages: tuple[str, ...]
+    selected_instructions: tuple[SourceInstruction, ...]
+
+
+@dataclass(frozen=True)
+class ConversionEpisode:
+    source: SourceEpisode
+    instruction: SourceInstruction
 
 
 def convert_dataset(
@@ -54,6 +75,8 @@ def convert_dataset(
     overwrite: bool = False,
     num_workers: int = 1,
     skip_preflight: bool = False,
+    rxr_annotations: str | Path | None = None,
+    flat_output: bool = False,
 ) -> Path:
     """Convert one replay split into stable Map2Nav VLN-CE data."""
 
@@ -69,11 +92,24 @@ def convert_dataset(
         raise ValueError(f"unsupported split: {split!r}")
     if dataset_name not in {"r2r", "rxr_guide"}:
         raise ValueError(f"unsupported dataset_name: {dataset_name!r}")
+    if dataset_name == "r2r" and rxr_annotations is not None:
+        raise ValueError("rxr_annotations is only valid for dataset_name='rxr_guide'")
 
     input_root = Path(input_root).resolve()
     output_root = Path(output_root).resolve()
+    annotation_index: dict[str, dict[str, str]] | None = None
+    annotation_context: dict[str, Any] | None = None
+    if dataset_name == "rxr_guide":
+        if rxr_annotations is None:
+            raise SourceSchemaError(
+                "rxr_guide conversion requires the authoritative RxR guide annotation "
+                "JSON/JSON.GZ so language is selected by metadata rather than text heuristics"
+            )
+        annotation_path = Path(rxr_annotations).resolve()
+        annotation_index = _load_rxr_annotations(annotation_path)
+        annotation_context = _file_identity(annotation_path)
     split_root = input_root / split
-    dataset_root = output_root / split
+    dataset_root = output_root if flat_output else output_root / split
     preexisting_output = dataset_root.exists()
     if preexisting_output and not overwrite and not resume:
         raise FileExistsError(
@@ -87,6 +123,10 @@ def convert_dataset(
         "split": split,
         "chunk_size": chunk_size,
         "copy_mode": "copy2",
+        "output_layout": "flat" if flat_output else "split_subdirectory",
+        "episode_unit": "one_source_instruction",
+        "rxr_languages": list(RXR_ENGLISH_LANGUAGES) if dataset_name == "rxr_guide" else None,
+        "rxr_annotations": annotation_context,
     }
     if preexisting_output and resume and context_path.is_file():
         existing_context = _read_json(context_path)
@@ -102,12 +142,34 @@ def convert_dataset(
         )
 
     candidates = (
-        _scan_manifest_fast(split_root, dataset_name=dataset_name, split=split)
+        _scan_manifest_fast(
+            split_root,
+            dataset_name=dataset_name,
+            split=split,
+            annotation_index=annotation_index,
+        )
         if skip_preflight
-        else _scan_source(split_root, dataset_name=dataset_name, split=split)
+        else _scan_source(
+            split_root,
+            dataset_name=dataset_name,
+            split=split,
+            annotation_index=annotation_index,
+        )
     )
+    selected_source_ids = [
+        instruction.episode_id
+        for candidate in candidates
+        for instruction in candidate.selected_instructions
+    ]
+    if len(selected_source_ids) != len(set(selected_source_ids)):
+        raise SourceSchemaError("selected source instruction episode_ids are not globally unique")
     single_floor = [candidate for candidate in candidates if candidate.eligibility.accepted]
-    selected = single_floor[:max_episodes]
+    eligible_episodes = [
+        ConversionEpisode(source=candidate, instruction=instruction)
+        for candidate in single_floor
+        for instruction in candidate.selected_instructions
+    ]
+    selected = eligible_episodes[:max_episodes]
     skipped = [candidate for candidate in candidates if not candidate.eligibility.accepted]
 
     if preexisting_output and overwrite:
@@ -130,17 +192,17 @@ def convert_dataset(
     staging_root = dataset_root / ".staging"
     staging_root.mkdir(parents=True, exist_ok=True)
 
-    jobs: list[tuple[int, SourceEpisode, int]] = []
+    jobs: list[tuple[int, ConversionEpisode, int]] = []
     global_frame_start = 0
     for episode_index, candidate in enumerate(selected):
         jobs.append((episode_index, candidate, global_frame_start))
-        global_frame_start += candidate.length
+        global_frame_start += candidate.source.length
 
     fragments: list[dict[str, Any]] = []
     expected_video: VideoInfo | None = None
     progress = tqdm(total=len(jobs), desc=f"Converting {dataset_name}/{split}", unit="episode")
 
-    def process(job: tuple[int, SourceEpisode, int]) -> tuple[dict[str, Any], bool]:
+    def process(job: tuple[int, ConversionEpisode, int]) -> tuple[dict[str, Any], bool]:
         episode_index, candidate, frame_start = job
         fragment_path = journal_root / f"episode_{episode_index:06d}.json"
         if resume and fragment_path.is_file():
@@ -162,7 +224,7 @@ def convert_dataset(
             dataset_name=dataset_name,
             split=split,
             episode_index=episode_index,
-            task_index=0,
+            task_index=episode_index,
             global_frame_start=frame_start,
             chunk_size=chunk_size,
         )
@@ -224,6 +286,7 @@ def convert_dataset(
         fragments=fragments,
         candidates=candidates,
         single_floor=single_floor,
+        eligible_episodes=eligible_episodes,
         skipped=skipped,
         max_episodes=max_episodes,
         num_workers=num_workers,
@@ -235,7 +298,13 @@ def convert_dataset(
     return dataset_root
 
 
-def _scan_source(split_root: Path, *, dataset_name: str, split: str) -> list[SourceEpisode]:
+def _scan_source(
+    split_root: Path,
+    *,
+    dataset_name: str,
+    split: str,
+    annotation_index: dict[str, dict[str, str]] | None,
+) -> list[SourceEpisode]:
     manifest_path = split_root / "manifest.jsonl"
     errors_path = split_root / "errors.jsonl"
     if not manifest_path.is_file():
@@ -272,6 +341,15 @@ def _scan_source(split_root: Path, *, dataset_name: str, split: str) -> list[Sou
         steps = _read_jsonl(episode_dir / "steps.jsonl")
         _validate_episode_identity(row, episode, manifest_index)
         _validate_steps(steps, episode=episode, manifest=row, source_dir=episode_dir)
+        source_instruction_count, source_languages, selected_instructions = (
+            _select_source_instructions(
+                row,
+                episode,
+                dataset_name=dataset_name,
+                annotation_index=annotation_index,
+                source_dir=episode_dir,
+            )
+        )
         eligibility = classify_floor_levels(steps)
         candidates.append(
             SourceEpisode(
@@ -282,13 +360,20 @@ def _scan_source(split_root: Path, *, dataset_name: str, split: str) -> list[Sou
                 scene_key=str(episode.get("scene_key", "")),
                 eligibility=eligibility,
                 length=len(steps),
+                source_instruction_count=source_instruction_count,
+                source_languages=source_languages,
+                selected_instructions=selected_instructions,
             )
         )
     return candidates
 
 
 def _scan_manifest_fast(
-    split_root: Path, *, dataset_name: str, split: str
+    split_root: Path,
+    *,
+    dataset_name: str,
+    split: str,
+    annotation_index: dict[str, dict[str, str]] | None,
 ) -> list[SourceEpisode]:
     """Build conversion jobs from manifest/episode metadata without step preflight.
 
@@ -318,6 +403,17 @@ def _scan_manifest_fast(
             )
         relative = row.get("episode_dir")
         episode_dir = _safe_source_path(split_root, relative)
+        episode = _read_json(episode_dir / "episode.json")
+        _validate_episode_identity(row, episode, manifest_index)
+        source_instruction_count, source_languages, selected_instructions = (
+            _select_source_instructions(
+                row,
+                episode,
+                dataset_name=dataset_name,
+                annotation_index=annotation_index,
+                source_dir=episode_dir,
+            )
+        )
         overlay_paths = row.get("overlay_paths", [])
         level_ids = tuple(
             sorted(
@@ -348,9 +444,93 @@ def _scan_manifest_fast(
                 scene_key=str(row.get("scene_key", "")),
                 eligibility=eligibility,
                 length=length,
+                source_instruction_count=source_instruction_count,
+                source_languages=source_languages,
+                selected_instructions=selected_instructions,
             )
         )
     return candidates
+
+
+def _select_source_instructions(
+    manifest: dict[str, Any],
+    episode: dict[str, Any],
+    *,
+    dataset_name: str,
+    annotation_index: dict[str, dict[str, str]] | None,
+    source_dir: Path,
+) -> tuple[int, tuple[str, ...], tuple[SourceInstruction, ...]]:
+    raw_instructions = episode.get("instructions")
+    if not isinstance(raw_instructions, list) or not raw_instructions:
+        raise SourceSchemaError(f"instructions must be a non-empty list: {source_dir}")
+
+    manifest_count = manifest.get("num_instructions")
+    if int(manifest_count if manifest_count is not None else -1) != len(raw_instructions):
+        raise SourceSchemaError(
+            f"manifest num_instructions does not match episode.json: {source_dir}"
+        )
+    source_episode_ids = [str(value) for value in episode.get("episode_ids", [])]
+    instruction_ids = [str(item.get("episode_id", "")) for item in raw_instructions]
+    if source_episode_ids != instruction_ids:
+        raise SourceSchemaError(
+            f"episode_ids must exactly match instructions in source order: {source_dir}"
+        )
+    if len(instruction_ids) != len(set(instruction_ids)):
+        raise SourceSchemaError(f"duplicate instruction episode_id: {source_dir}")
+
+    selected: list[SourceInstruction] = []
+    languages: set[str] = set()
+    source_trajectory_id = str(episode.get("trajectory_id", ""))
+    source_scene_id = str(episode.get("scene_id", ""))
+    for index, item in enumerate(raw_instructions):
+        if not isinstance(item, dict):
+            raise SourceSchemaError(f"instruction {index} is not an object: {source_dir}")
+        episode_id = str(item.get("episode_id", ""))
+        trajectory_id = str(item.get("trajectory_id", ""))
+        text = item.get("instruction")
+        if not episode_id or not trajectory_id or not isinstance(text, str) or not text.strip():
+            raise SourceSchemaError(f"invalid instruction {index}: {source_dir}")
+        if trajectory_id != source_trajectory_id:
+            raise SourceSchemaError(
+                f"instruction {episode_id} trajectory_id mismatch: {source_dir}"
+            )
+
+        language: str | None = None
+        if dataset_name == "rxr_guide":
+            if annotation_index is None:
+                raise SourceSchemaError("internal error: missing RxR annotation index")
+            annotation = annotation_index.get(episode_id)
+            if annotation is None:
+                raise SourceSchemaError(
+                    f"RxR annotation is missing replay episode_id={episode_id}: {source_dir}"
+                )
+            expected = {
+                "trajectory_id": trajectory_id,
+                "scene_id": source_scene_id,
+                "instruction": text,
+            }
+            for key, value in expected.items():
+                if annotation[key] != value:
+                    raise SourceSchemaError(
+                        f"RxR annotation mismatch for episode_id={episode_id} field={key}: "
+                        f"{source_dir}"
+                    )
+            language = annotation["language"]
+            languages.add(language)
+        elif isinstance(item.get("language"), str):
+            language = str(item["language"])
+            languages.add(language)
+
+        instruction = SourceInstruction(
+            episode_id=episode_id,
+            trajectory_id=trajectory_id,
+            text=text,
+            language=language,
+        )
+        if dataset_name == "r2r" or language in RXR_ENGLISH_LANGUAGES:
+            selected.append(instruction)
+
+    return len(raw_instructions), tuple(sorted(languages)), tuple(selected)
 
 
 def _convert_episode(
@@ -358,7 +538,7 @@ def _convert_episode(
     split_root: Path,
     dataset_root: Path,
     staging_root: Path,
-    candidate: SourceEpisode,
+    candidate: ConversionEpisode,
     dataset_name: str,
     split: str,
     episode_index: int,
@@ -366,14 +546,17 @@ def _convert_episode(
     global_frame_start: int,
     chunk_size: int,
 ) -> dict[str, Any]:
-    episode = _read_json(candidate.episode_dir / "episode.json")
-    steps = _read_jsonl(candidate.episode_dir / "steps.jsonl")
+    source_episode = candidate.source
+    instruction = candidate.instruction
+    episode = _read_json(source_episode.episode_dir / "episode.json")
+    steps = _read_jsonl(source_episode.episode_dir / "steps.jsonl")
     eligibility = classify_floor_levels(steps)
     if not eligibility.accepted or eligibility.source_level_id is None:
         raise SourceSchemaError(
-            f"accepted source episode changed floor eligibility: {candidate.episode_dir}"
+            f"accepted source episode changed floor eligibility: {source_episode.episode_dir}"
         )
-    _validate_steps(steps, episode=episode, manifest=None, source_dir=candidate.episode_dir)
+    _validate_steps(steps, episode=episode, manifest=None, source_dir=source_episode.episode_dir)
+    _validate_selected_instruction(episode, instruction, source_dir=source_episode.episode_dir)
     bundle = resolve_map_bundle(split_root, episode, eligibility.source_level_id)
     positions = np.asarray([step["position"] for step in steps], dtype=np.float64)
     rotations = np.asarray([step["rotation"] for step in steps], dtype=np.float64)
@@ -382,10 +565,10 @@ def _convert_episode(
     max_projection_error = int(np.abs(projected - source_pixels).max(initial=0))
     if max_projection_error > 1:
         raise SourceSchemaError(
-            f"floorplan projection differs by {max_projection_error}px: {candidate.episode_dir}"
+            f"floorplan projection differs by {max_projection_error}px: {source_episode.episode_dir}"
         )
 
-    video = _video_info(episode, candidate.episode_dir)
+    video = _video_info(episode, source_episode.episode_dir)
     states = habitat_poses_to_xnav(positions, rotations)
     rows, stats = _build_rows(
         steps=steps,
@@ -410,7 +593,7 @@ def _convert_episode(
     staged_files[parquet_relative.as_posix()] = parquet_stage
 
     for source_view, output_view in RGB_VIEW_MAP.items():
-        source = candidate.episode_dir / f"{source_view}.mp4"
+        source_path = source_episode.episode_dir / f"{source_view}.mp4"
         relative = (
             Path("videos")
             / f"chunk-{chunk:03d}"
@@ -418,7 +601,7 @@ def _convert_episode(
             / f"{episode_name}.mp4"
         )
         stage_path = stage / f"video.{output_view}.mp4"
-        _copy_file(source, stage_path)
+        _copy_file(source_path, stage_path)
         staged_files[relative.as_posix()] = stage_path
 
     map_assets: dict[str, str] = {}
@@ -432,14 +615,18 @@ def _convert_episode(
     _validate_staged_episode(staged_files, expected_rows=len(rows))
     for parent in {str((dataset_root / relative).parent) for relative in staged_files}:
         Path(parent).mkdir(parents=True, exist_ok=True)
-    for relative, source in staged_files.items():
+    for relative, source_path in staged_files.items():
         target = dataset_root / relative
-        os.replace(source, target)
+        os.replace(source_path, target)
     stage.rmdir()
 
-    instructions = episode.get("instructions", [])
-    if not isinstance(instructions, list):
-        raise SourceSchemaError(f"instructions must be a list: {candidate.episode_dir}")
+    instruction_payload: dict[str, Any] = {
+        "episode_id": instruction.episode_id,
+        "trajectory_id": instruction.trajectory_id,
+        "instruction": instruction.text,
+    }
+    if instruction.language is not None:
+        instruction_payload["language"] = instruction.language
     extras = {
         "schema_version": SCHEMA_VERSION,
         "episode_index": episode_index,
@@ -449,8 +636,8 @@ def _convert_episode(
         "trajectory_id": str(episode.get("trajectory_id", "")),
         "scene_key": str(episode.get("scene_key", "")),
         "source_episode_ids": [str(value) for value in episode.get("episode_ids", [])],
-        "source_episode_dir": candidate.episode_dir_relative,
-        "instructions": instructions,
+        "source_episode_dir": source_episode.episode_dir_relative,
+        "instructions": [instruction_payload],
         "video": {
             "width": video.width,
             "height": video.height,
@@ -463,8 +650,9 @@ def _convert_episode(
         "map_assets": map_assets,
     }
     return {
-        "source_manifest_index": candidate.manifest_index,
-        "source_episode_dir": candidate.episode_dir_relative,
+        "source_manifest_index": source_episode.manifest_index,
+        "source_episode_dir": source_episode.episode_dir_relative,
+        "source_instruction_episode_id": instruction.episode_id,
         "episode_index": episode_index,
         "global_frame_start": global_frame_start,
         "length": len(rows),
@@ -477,9 +665,10 @@ def _convert_episode(
         "output_files": list(staged_files),
         "episode": {
             "episode_index": episode_index,
-            "tasks": [DEFAULT_TASK],
+            "tasks": [instruction.text],
             "length": len(rows),
         },
+        "task": {"task_index": task_index, "task": instruction.text},
         "stats": {"episode_index": episode_index, "stats": stats},
         "extras": extras,
     }
@@ -545,6 +734,7 @@ def _write_final_metadata(
     fragments: list[dict[str, Any]],
     candidates: list[SourceEpisode],
     single_floor: list[SourceEpisode],
+    eligible_episodes: list[ConversionEpisode],
     skipped: list[SourceEpisode],
     max_episodes: int | None,
     num_workers: int,
@@ -560,7 +750,7 @@ def _write_final_metadata(
         "fps": video.fps,
         "total_episodes": total_episodes,
         "total_frames": total_frames,
-        "total_tasks": 1,
+        "total_tasks": total_episodes,
         "total_videos": total_episodes * len(RGB_VIEW_MAP),
         "total_chunks": math.ceil(total_episodes / chunk_size),
         "chunks_size": chunk_size,
@@ -573,7 +763,7 @@ def _write_final_metadata(
         "splits": {split: f"0:{total_episodes}"},
     }
     _write_json_atomic(meta / "info.json", info)
-    _write_jsonl_atomic(meta / "tasks.jsonl", [{"task_index": 0, "task": DEFAULT_TASK}])
+    _write_jsonl_atomic(meta / "tasks.jsonl", [fragment["task"] for fragment in fragments])
     _write_jsonl_atomic(meta / "episodes.jsonl", [fragment["episode"] for fragment in fragments])
     _write_jsonl_atomic(meta / "episodes_stats.jsonl", [fragment["stats"] for fragment in fragments])
     _write_jsonl_atomic(meta / "episodes_extras.jsonl", [fragment["extras"] for fragment in fragments])
@@ -587,21 +777,67 @@ def _write_final_metadata(
                 "scene_key": candidate.scene_key,
                 "reason": "multi_floor",
                 "visited_levels": list(candidate.eligibility.visited_levels),
+                "source_instruction_count": candidate.source_instruction_count,
+                "selected_instruction_count": len(candidate.selected_instructions),
             }
             for candidate in skipped
+        ]
+        + [
+            {
+                "source_manifest_index": candidate.manifest_index,
+                "source_episode_dir": candidate.episode_dir_relative,
+                "trajectory_id": candidate.trajectory_id,
+                "scene_key": candidate.scene_key,
+                "reason": "no_selected_instruction",
+                "visited_levels": list(candidate.eligibility.visited_levels),
+                "source_instruction_count": candidate.source_instruction_count,
+                "selected_instruction_count": 0,
+                "source_languages": list(candidate.source_languages),
+            }
+            for candidate in single_floor
+            if not candidate.selected_instructions
         ],
+    )
+    selected_single_floor = [candidate for candidate in single_floor if candidate.selected_instructions]
+    eligible_language_counts = Counter(
+        episode.instruction.language
+        for episode in eligible_episodes
+        if episode.instruction.language is not None
+    )
+    accepted_language_counts = Counter(
+        fragment["extras"]["instructions"][0].get("language")
+        for fragment in fragments
+        if fragment["extras"]["instructions"][0].get("language") is not None
     )
     report = {
         "schema_version": SCHEMA_VERSION,
         "dataset_name": dataset_name,
         "split": split,
         "copy_mode": "copy2",
+        "episode_unit": "one_source_instruction",
+        "rxr_languages": list(RXR_ENGLISH_LANGUAGES) if dataset_name == "rxr_guide" else None,
         "source_manifest_total": len(candidates),
+        "source_instruction_total": sum(
+            candidate.source_instruction_count for candidate in candidates
+        ),
+        "selected_instruction_total_before_floor_filter": sum(
+            len(candidate.selected_instructions) for candidate in candidates
+        ),
         "eligible_single_floor": len(single_floor),
+        "eligible_single_floor_with_selected_instructions": len(selected_single_floor),
+        "language_filtered_single_floor": len(single_floor) - len(selected_single_floor),
+        "eligible_instruction_episodes": len(eligible_episodes),
+        "eligible_instruction_language_counts": dict(sorted(eligible_language_counts.items())),
         "accepted": total_episodes,
         "accepted_frames": total_frames,
+        "accepted_instruction_language_counts": dict(sorted(accepted_language_counts.items())),
         "skipped_multi_floor": len(skipped),
-        "unconverted_single_floor_due_to_limit": len(single_floor) - total_episodes,
+        "skipped_multi_floor_selected_instructions": sum(
+            len(candidate.selected_instructions) for candidate in skipped
+        ),
+        "unconverted_eligible_instruction_episodes_due_to_limit": (
+            len(eligible_episodes) - total_episodes
+        ),
         "errors": 0,
         "max_episodes": max_episodes,
         "num_workers": num_workers,
@@ -664,6 +900,29 @@ def _validate_episode_identity(
             )
 
 
+def _validate_selected_instruction(
+    episode: dict[str, Any], instruction: SourceInstruction, *, source_dir: Path
+) -> None:
+    matches = [
+        item
+        for item in episode.get("instructions", [])
+        if isinstance(item, dict) and str(item.get("episode_id", "")) == instruction.episode_id
+    ]
+    if len(matches) != 1:
+        raise SourceSchemaError(
+            f"selected instruction episode_id={instruction.episode_id} changed: {source_dir}"
+        )
+    item = matches[0]
+    if (
+        str(item.get("trajectory_id", "")) != instruction.trajectory_id
+        or item.get("instruction") != instruction.text
+    ):
+        raise SourceSchemaError(
+            f"selected instruction episode_id={instruction.episode_id} content changed: "
+            f"{source_dir}"
+        )
+
+
 def _video_info(episode: dict[str, Any], source_dir: Path) -> VideoInfo:
     try:
         video = VideoInfo(
@@ -703,16 +962,18 @@ def _validate_resume_fragment(
     fragment: dict[str, Any],
     *,
     dataset_root: Path,
-    candidate: SourceEpisode,
+    candidate: ConversionEpisode,
     episode_index: int,
     global_frame_start: int,
 ) -> None:
+    source = candidate.source
     expected = {
-        "source_manifest_index": candidate.manifest_index,
-        "source_episode_dir": candidate.episode_dir_relative,
+        "source_manifest_index": source.manifest_index,
+        "source_episode_dir": source.episode_dir_relative,
+        "source_instruction_episode_id": candidate.instruction.episode_id,
         "episode_index": episode_index,
         "global_frame_start": global_frame_start,
-        "length": candidate.length,
+        "length": source.length,
     }
     for key, value in expected.items():
         if fragment.get(key) != value:
@@ -758,6 +1019,63 @@ def _safe_source_path(root: Path, raw: Any) -> Path:
     if not path.is_dir():
         raise SourceSchemaError(f"missing episode directory: {path}")
     return path
+
+
+def _load_rxr_annotations(path: Path) -> dict[str, dict[str, str]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"missing RxR annotation file: {path}")
+    try:
+        opener = gzip.open if path.suffix == ".gz" else Path.open
+        if path.suffix == ".gz":
+            with opener(path, "rt", encoding="utf-8") as handle:
+                value = json.load(handle)
+        else:
+            with opener(path, "r", encoding="utf-8") as handle:
+                value = json.load(handle)
+    except Exception as exc:
+        raise SourceSchemaError(f"cannot read RxR annotation JSON: {path}") from exc
+    episodes = value.get("episodes") if isinstance(value, dict) else None
+    if not isinstance(episodes, list) or not episodes:
+        raise SourceSchemaError(f"RxR annotation JSON has no episodes: {path}")
+
+    index: dict[str, dict[str, str]] = {}
+    for row_index, episode in enumerate(episodes):
+        instruction = episode.get("instruction") if isinstance(episode, dict) else None
+        if not isinstance(instruction, dict):
+            raise SourceSchemaError(f"invalid RxR annotation episode {row_index}: {path}")
+        episode_id = str(episode.get("episode_id", ""))
+        record = {
+            "trajectory_id": str(episode.get("trajectory_id", "")),
+            "scene_id": str(episode.get("scene_id", "")),
+            "instruction": instruction.get("instruction_text"),
+            "language": instruction.get("language"),
+        }
+        if (
+            not episode_id
+            or not record["trajectory_id"]
+            or not record["scene_id"]
+            or not isinstance(record["instruction"], str)
+            or not record["instruction"].strip()
+            or not isinstance(record["language"], str)
+            or not record["language"]
+        ):
+            raise SourceSchemaError(f"invalid RxR annotation episode {row_index}: {path}")
+        if episode_id in index:
+            raise SourceSchemaError(f"duplicate RxR annotation episode_id={episode_id}: {path}")
+        index[episode_id] = record
+    return index
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _read_json(path: Path) -> dict[str, Any]:

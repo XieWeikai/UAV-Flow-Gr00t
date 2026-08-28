@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
@@ -157,10 +158,11 @@ def create_replay_source(root: Path, *, split: str = "train") -> Path:
             "scene_key": "TestScene",
             "instructions": [
                 {
-                    "episode_id": str(trajectory_index * 3),
+                    "episode_id": str(trajectory_index * 3 + offset),
                     "trajectory_id": name,
-                    "instruction": f"instruction for {name}",
+                    "instruction": f"instruction {offset} for {name}",
                 }
+                for offset in range(3)
             ],
             "num_steps": 2,
             "num_frames": 2,
@@ -206,7 +208,7 @@ def create_replay_source(root: Path, *, split: str = "train") -> Path:
                 "video_views": ["front", "back", "left", "right"],
                 "num_steps": 2,
                 "num_frames": 2,
-                "num_instructions": 1,
+                "num_instructions": 3,
                 "overlay_paths": overlay_paths,
             }
         )
@@ -215,3 +217,71 @@ def create_replay_source(root: Path, *, split: str = "train") -> Path:
     write_jsonl(split_root / "errors.jsonl", [])
     return root
 
+
+def create_rxr_replay_source(
+    root: Path, *, split: str = "train"
+) -> tuple[Path, Path]:
+    source_root = create_replay_source(root, split=split)
+    split_root = source_root / split
+    manifest = read_jsonl(split_root / "manifest.jsonl")
+    annotations: list[dict] = []
+    next_episode_id = 1000
+
+    for row in manifest:
+        episode_path = split_root / row["episode_dir"] / "episode.json"
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        languages = (
+            ["en-US", "en-IN", "hi-IN", "te-IN"]
+            if episode["trajectory_id"] != "single_b"
+            else ["hi-IN", "te-IN"]
+        )
+        instructions = []
+        for language in languages:
+            episode_id = str(next_episode_id)
+            next_episode_id += 1
+            text = f"{language} instruction for {episode['trajectory_id']}"
+            instructions.append(
+                {
+                    "episode_id": episode_id,
+                    "trajectory_id": episode["trajectory_id"],
+                    "instruction": text,
+                }
+            )
+            annotations.append(
+                {
+                    "episode_id": episode_id,
+                    "trajectory_id": episode["trajectory_id"],
+                    "scene_id": episode["scene_id"],
+                    "info": {"role": "guide"},
+                    "instruction": {
+                        "instruction_text": text,
+                        "language": language,
+                    },
+                }
+            )
+
+        episode.update(
+            {
+                "dataset": "rxr",
+                "role": "guide",
+                "episode_id": instructions[0]["episode_id"],
+                "episode_ids": [item["episode_id"] for item in instructions],
+                "instructions": instructions,
+            }
+        )
+        write_json(episode_path, episode)
+        row.update(
+            {
+                "dataset": "rxr",
+                "role": "guide",
+                "episode_id": episode["episode_id"],
+                "episode_ids": episode["episode_ids"],
+                "num_instructions": len(instructions),
+            }
+        )
+
+    write_jsonl(split_root / "manifest.jsonl", manifest)
+    annotation_path = root / f"{split}_guide.json.gz"
+    with gzip.open(annotation_path, "wt", encoding="utf-8") as handle:
+        json.dump({"episodes": annotations}, handle, ensure_ascii=False)
+    return source_root, annotation_path

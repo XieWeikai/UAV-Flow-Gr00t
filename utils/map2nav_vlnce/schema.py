@@ -9,8 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
-SCHEMA_VERSION = "map2nav_vlnce_v1"
+SCHEMA_VERSION = "map2nav_vlnce_v2"
 POSE_AXES = ["tx", "ty", "tz", "qx", "qy", "qz", "qw"]
 MAP_ASSET_KEYS = (
     "graph",
@@ -41,10 +40,6 @@ PARQUET_COLUMNS = [
     "extra.discrete_action_to_next_id",
     "extra.cot",
 ]
-DEFAULT_TASK = (
-    "Navigate through the indoor scene using the current multi-view RGB observations "
-    "and the provided floor map."
-)
 
 
 @dataclass(frozen=True)
@@ -156,7 +151,7 @@ def build_modality() -> dict[str, Any]:
             "drone": {
                 "start": 0,
                 "end": 7,
-                "absolute": False,
+                "absolute": True,
                 "rotation_type": "quaternion",
                 "original_key": "observation.state",
             }
@@ -165,7 +160,7 @@ def build_modality() -> dict[str, Any]:
             "pose": {
                 "start": 0,
                 "end": 7,
-                "absolute": False,
+                "absolute": True,
                 "rotation_type": "quaternion",
                 "original_key": "action",
             }
@@ -194,4 +189,3 @@ def numeric_stats(values: dict[str, np.ndarray]) -> dict[str, dict[str, Any]]:
             "count": [int(array.shape[0])],
         }
     return stats
-

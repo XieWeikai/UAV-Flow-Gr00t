@@ -16,4 +16,43 @@ uv sync --all-groups
 - [`lerobot_creator_example.py`](lerobot_creator_example.py): 教程示例代码。
 - [`unreal.py`](unreal.py): 将 `3d-simu-ue` 录制出的 raw episode 转为按 scene 组织的 LeRobot v2.1 数据集；使用说明见脚本顶部注释。
 
+## Map2Nav VLN-CE replay
 
+`map2nav_vlnce.py` 将单层 R2R/RxR replay 转成 Enactive 可读取的 LeRobot v2.1
+pose-only 数据。一个物理轨迹中的每条指令会分别生成一个独立 episode，并在
+`tasks.jsonl`、`episodes.jsonl` 和帧级 `task_index` 中保存真实指令。
+
+RxR replay 本身没有保留语言字段，因此转换 `rxr_guide` 时必须通过
+`--rxr-annotations` 传入权威的 guide annotation。转换器按 `episode_id` 校验文本、
+trajectory 和 scene，只保留 `en-US` 与 `en-IN`；不会根据字符集猜测语言。
+
+```bash
+.venv/bin/python map2nav_vlnce.py \
+  --input-root /data/glx/indoor_data/map2nav/r2r_replay_4_view_2048 \
+  --output-root /data/glx/indoor_data/map2nav/processed_v2/r2r \
+  --dataset-name r2r \
+  --split train \
+  --flat-output \
+  --num-workers 32
+
+.venv/bin/python map2nav_vlnce.py \
+  --input-root /data/glx/indoor_data/map2nav/rxr_replay_guide_4_view_2048 \
+  --output-root /data/glx/indoor_data/map2nav/processed_v2/rxr \
+  --dataset-name rxr_guide \
+  --split train \
+  --rxr-annotations /data/glx/indoor_data/habitat/data/vln_ce/raw_data/rxr/train/train_guide.json.gz \
+  --flat-output \
+  --num-workers 32
+```
+
+固定的 train-only wrapper 使用 32 个 worker，一次执行会先转换 R2R，成功后再转换 RxR：
+
+```bash
+bash scripts/map2nav_vlnce.sh
+```
+
+wrapper 直接写入 `processed_v2/r2r` 与 `processed_v2/rxr`，不会增加中间的
+`train/` 目录。
+
+默认拒绝写入已存在的 split。中断后只可在 conversion context 完全一致时使用
+`--resume`；`--overwrite` 会删除并重建所选 split，使用前应单独确认目标路径。

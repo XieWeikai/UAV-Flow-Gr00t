@@ -10,7 +10,11 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 
-from test.map2nav_vlnce_testdata import create_replay_source, read_jsonl
+from test.map2nav_vlnce_testdata import (
+    create_replay_source,
+    create_rxr_replay_source,
+    read_jsonl,
+)
 from utils.map2nav_vlnce import convert_dataset
 from utils.map2nav_vlnce.filtering import SourceSchemaError
 from utils.map2nav_vlnce.schema import MAP_ASSET_KEYS, PARQUET_COLUMNS, SCHEMA_VERSION
@@ -36,6 +40,10 @@ def test_conversion_filters_before_limit_and_writes_stable_copy(tmp_path: Path) 
     )
     extras = read_jsonl(dataset_root / "meta" / "episodes_extras.jsonl")
     skipped = read_jsonl(dataset_root / "meta" / "skipped_episodes.jsonl")
+    tasks = read_jsonl(dataset_root / "meta" / "tasks.jsonl")
+    modality = json.loads(
+        (dataset_root / "meta" / "modality.json").read_text(encoding="utf-8")
+    )
 
     assert info["robot_type"] == "map2nav_vlnce"
     assert info["total_episodes"] == 1
@@ -49,10 +57,16 @@ def test_conversion_filters_before_limit_and_writes_stable_copy(tmp_path: Path) 
         "video.rear",
     }
     assert report["source_manifest_total"] == 3
+    assert report["source_instruction_total"] == 9
+    assert report["selected_instruction_total_before_floor_filter"] == 9
     assert report["eligible_single_floor"] == 2
+    assert report["eligible_single_floor_with_selected_instructions"] == 2
+    assert report["language_filtered_single_floor"] == 0
+    assert report["eligible_instruction_episodes"] == 6
     assert report["accepted"] == 1
     assert report["skipped_multi_floor"] == 1
-    assert report["unconverted_single_floor_due_to_limit"] == 1
+    assert report["skipped_multi_floor_selected_instructions"] == 3
+    assert report["unconverted_eligible_instruction_episodes_due_to_limit"] == 5
     assert report["errors"] == 0
     assert skipped == [
         {
@@ -62,8 +76,13 @@ def test_conversion_filters_before_limit_and_writes_stable_copy(tmp_path: Path) 
             "scene_key": "TestScene",
             "reason": "multi_floor",
             "visited_levels": [0, 1],
+            "source_instruction_count": 3,
+            "selected_instruction_count": 3,
         }
     ]
+    assert tasks == [{"task_index": 0, "task": "instruction 0 for single_a"}]
+    assert modality["state"]["drone"]["absolute"] is True
+    assert modality["action"]["pose"]["absolute"] is True
 
     extra = extras[0]
     assert extra["schema_version"] == SCHEMA_VERSION
@@ -74,7 +93,7 @@ def test_conversion_filters_before_limit_and_writes_stable_copy(tmp_path: Path) 
         {
             "episode_id": "3",
             "trajectory_id": "single_a",
-            "instruction": "instruction for single_a",
+            "instruction": "instruction 0 for single_a",
         }
     ]
     assert set(extra["map_assets"]) == set(MAP_ASSET_KEYS)
@@ -172,11 +191,17 @@ def test_parallel_conversion_preserves_accepted_manifest_order(tmp_path: Path) -
     )
 
     extras = read_jsonl(dataset_root / "meta" / "episodes_extras.jsonl")
-    assert [row["episode_index"] for row in extras] == [0, 1]
-    assert [row["trajectory_id"] for row in extras] == ["single_a", "single_b"]
+    tasks = read_jsonl(dataset_root / "meta" / "tasks.jsonl")
+    assert [row["episode_index"] for row in extras] == list(range(6))
+    assert [row["trajectory_id"] for row in extras] == ["single_a"] * 3 + ["single_b"] * 3
     assert [row["source_episode_dir"] for row in extras] == [
         "episodes/train/mp3d_TestScene_traj_single_a",
+    ] * 3 + [
         "episodes/train/mp3d_TestScene_traj_single_b",
+    ] * 3
+    assert tasks == [
+        {"task_index": index, "task": f"instruction {index % 3} for " + ("single_a" if index < 3 else "single_b")}
+        for index in range(6)
     ]
 
 
@@ -240,7 +265,91 @@ def test_preflight_schema_error_creates_no_output_split(tmp_path: Path) -> None:
     assert not (output_root / "train").exists()
 
 
-def test_map2nav_vlnce_cli_uses_copy_only_contract(tmp_path: Path) -> None:
+def test_rxr_conversion_joins_language_metadata_and_keeps_only_english(
+    tmp_path: Path,
+) -> None:
+    source_root, annotation_path = create_rxr_replay_source(tmp_path / "source")
+    output_root = tmp_path / "processed" / "rxr_guide"
+
+    dataset_root = convert_dataset(
+        source_root,
+        output_root,
+        "rxr_guide",
+        "train",
+        rxr_annotations=annotation_path,
+        num_workers=2,
+    )
+
+    info = json.loads((dataset_root / "meta" / "info.json").read_text(encoding="utf-8"))
+    report = json.loads(
+        (dataset_root / "meta" / "conversion_report.json").read_text(encoding="utf-8")
+    )
+    tasks = read_jsonl(dataset_root / "meta" / "tasks.jsonl")
+    extras = read_jsonl(dataset_root / "meta" / "episodes_extras.jsonl")
+    skipped = read_jsonl(dataset_root / "meta" / "skipped_episodes.jsonl")
+
+    assert info["total_episodes"] == 2
+    assert info["total_tasks"] == 2
+    assert info["total_frames"] == 4
+    assert report["source_manifest_total"] == 3
+    assert report["source_instruction_total"] == 10
+    assert report["selected_instruction_total_before_floor_filter"] == 4
+    assert report["eligible_single_floor"] == 2
+    assert report["eligible_single_floor_with_selected_instructions"] == 1
+    assert report["language_filtered_single_floor"] == 1
+    assert report["eligible_instruction_episodes"] == 2
+    assert report["eligible_instruction_language_counts"] == {"en-IN": 1, "en-US": 1}
+    assert report["accepted_instruction_language_counts"] == {"en-IN": 1, "en-US": 1}
+    assert report["skipped_multi_floor"] == 1
+    assert report["skipped_multi_floor_selected_instructions"] == 2
+    assert tasks == [
+        {"task_index": 0, "task": "en-US instruction for single_a"},
+        {"task_index": 1, "task": "en-IN instruction for single_a"},
+    ]
+    assert [row["instructions"][0]["language"] for row in extras] == ["en-US", "en-IN"]
+    assert [row["instructions"][0]["episode_id"] for row in extras] == ["1004", "1005"]
+    assert [row["reason"] for row in skipped] == ["multi_floor", "no_selected_instruction"]
+    assert skipped[1]["source_languages"] == ["hi-IN", "te-IN"]
+
+
+def test_rxr_conversion_requires_authoritative_language_annotations(tmp_path: Path) -> None:
+    source_root, _ = create_rxr_replay_source(tmp_path / "source")
+    output_root = tmp_path / "processed" / "rxr_guide"
+
+    with pytest.raises(SourceSchemaError, match="authoritative RxR guide annotation"):
+        convert_dataset(source_root, output_root, "rxr_guide", "train")
+
+    assert not (output_root / "train").exists()
+
+
+def test_rxr_cli_accepts_authoritative_annotations(tmp_path: Path) -> None:
+    source_root, annotation_path = create_rxr_replay_source(tmp_path / "source")
+    output_root = tmp_path / "processed" / "rxr_guide"
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "map2nav_vlnce.py"),
+        "--input-root",
+        str(source_root),
+        "--output-root",
+        str(output_root),
+        "--dataset-name",
+        "rxr_guide",
+        "--split",
+        "train",
+        "--rxr-annotations",
+        str(annotation_path),
+        "--max-episodes",
+        "1",
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    tasks = read_jsonl(output_root / "train" / "meta" / "tasks.jsonl")
+    assert tasks == [{"task_index": 0, "task": "en-US instruction for single_a"}]
+
+
+def test_map2nav_vlnce_cli_uses_flat_copy_only_contract(tmp_path: Path) -> None:
     source_root = create_replay_source(tmp_path / "source")
     output_root = tmp_path / "processed" / "r2r"
     command = [
@@ -254,6 +363,7 @@ def test_map2nav_vlnce_cli_uses_copy_only_contract(tmp_path: Path) -> None:
         "r2r",
         "--split",
         "train",
+        "--flat-output",
         "--max-episodes",
         "1",
     ]
@@ -262,4 +372,27 @@ def test_map2nav_vlnce_cli_uses_copy_only_contract(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "map2nav_vlnce" in result.stdout
-    assert (output_root / "train" / "meta" / "conversion_report.json").is_file()
+    assert (output_root / "meta" / "conversion_report.json").is_file()
+    assert not (output_root / "train").exists()
+    context = json.loads(
+        (output_root / "meta" / ".conversion" / "context.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert context["output_layout"] == "flat"
+
+
+def test_map2nav_wrapper_runs_both_flat_train_exports_with_32_workers() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "map2nav_vlnce.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "MAP2NAV_NUM_WORKERS=32" in script
+    assert script.count("--flat-output") == 2
+    assert script.count("--split train") == 2
+    assert "processed_v2/r2r" not in script
+    assert '${processed_root}/r2r' in script
+    assert '${processed_root}/rxr' in script
+    assert script.index("r2r_replay_4_view_2048") < script.index(
+        "rxr_replay_guide_4_view_2048"
+    )

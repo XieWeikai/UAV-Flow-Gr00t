@@ -14,6 +14,7 @@ from test.map2nav_vlnce_testdata import (
     create_replay_source,
     create_rxr_replay_source,
     read_jsonl,
+    write_jsonl,
 )
 from utils.map2nav_vlnce import convert_dataset
 from utils.map2nav_vlnce.filtering import SourceSchemaError
@@ -265,6 +266,31 @@ def test_preflight_schema_error_creates_no_output_split(tmp_path: Path) -> None:
     assert not (output_root / "train").exists()
 
 
+def test_conversion_ignores_recorded_source_errors_and_reports_count(
+    tmp_path: Path,
+) -> None:
+    source_root = create_replay_source(tmp_path / "source")
+    write_jsonl(
+        source_root / "train" / "errors.jsonl",
+        [{"episode_dir_name": "failed_trajectory", "error": "GreedyFollowerError()"}],
+    )
+
+    dataset_root = convert_dataset(
+        source_root,
+        tmp_path / "processed" / "r2r",
+        "r2r",
+        "train",
+    )
+
+    report = json.loads(
+        (dataset_root / "meta" / "conversion_report.json").read_text(encoding="utf-8")
+    )
+    assert report["source_manifest_total"] == 3
+    assert report["source_recorded_errors"] == 1
+    assert report["complete_success_manifest_conversion"] is True
+    assert report["complete_source_conversion"] is False
+
+
 def test_rxr_conversion_joins_language_metadata_and_keeps_only_english(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +336,32 @@ def test_rxr_conversion_joins_language_metadata_and_keeps_only_english(
     assert [row["instructions"][0]["episode_id"] for row in extras] == ["1004", "1005"]
     assert [row["reason"] for row in skipped] == ["multi_floor", "no_selected_instruction"]
     assert skipped[1]["source_languages"] == ["hi-IN", "te-IN"]
+
+
+def test_rxr_conversion_accepts_rxr_en_guide_source_identity(tmp_path: Path) -> None:
+    source_root, annotation_path = create_rxr_replay_source(tmp_path / "source")
+    split_root = source_root / "train"
+    manifest = read_jsonl(split_root / "manifest.jsonl")
+    for row in manifest:
+        row["dataset"] = "rxr_en"
+        episode_path = split_root / row["episode_dir"] / "episode.json"
+        episode = json.loads(episode_path.read_text(encoding="utf-8"))
+        episode["dataset"] = "rxr_en"
+        episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    write_jsonl(split_root / "manifest.jsonl", manifest)
+
+    dataset_root = convert_dataset(
+        source_root,
+        tmp_path / "processed" / "rxr_guide",
+        "rxr_guide",
+        "train",
+        max_episodes=1,
+        rxr_annotations=annotation_path,
+    )
+
+    extras = read_jsonl(dataset_root / "meta" / "episodes_extras.jsonl")
+    assert extras[0]["dataset_name"] == "rxr_guide"
+    assert extras[0]["role"] == "guide"
 
 
 def test_rxr_conversion_requires_authoritative_language_annotations(tmp_path: Path) -> None:

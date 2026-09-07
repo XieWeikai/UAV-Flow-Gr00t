@@ -22,9 +22,14 @@ uv sync --all-groups
 pose-only 数据。一个物理轨迹中的每条指令会分别生成一个独立 episode，并在
 `tasks.jsonl`、`episodes.jsonl` 和帧级 `task_index` 中保存真实指令。
 
-RxR replay 本身没有保留语言字段，因此转换 `rxr_guide` 时必须通过
-`--rxr-annotations` 传入权威的 guide annotation。转换器按 `episode_id` 校验文本、
-trajectory 和 scene，只保留 `en-US` 与 `en-IN`；不会根据字符集猜测语言。
+转换 `rxr_guide` 时必须通过 `--rxr-annotations` 传入权威的 guide annotation。
+转换器按 `episode_id` 校验文本、trajectory 和 scene，只保留 `en-US` 与 `en-IN`；
+不会根据 replay 中的语言字段或字符集猜测语言。源 replay 的数据标识可以是
+`rxr/guide` 或预先筛选英文后的 `rxr_en/guide`。
+
+转换始终以成功的 `manifest.jsonl` 为输入。`errors.jsonl` 中已记录的 replay 失败项
+不会阻断转换，其数量会写入 `conversion_report.json` 的
+`source_recorded_errors` 字段；失败目录不会被扫描或转换。
 
 ```bash
 .venv/bin/python map2nav_vlnce.py \

@@ -34,6 +34,10 @@ from .schema import (
 )
 
 RXR_ENGLISH_LANGUAGES = ("en-IN", "en-US")
+EXPECTED_SOURCE_IDENTITIES = {
+    "r2r": frozenset({("r2r", None)}),
+    "rxr_guide": frozenset({("rxr", "guide"), ("rxr_en", "guide")}),
+}
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ def convert_dataset(
         annotation_index = _load_rxr_annotations(annotation_path)
         annotation_context = _file_identity(annotation_path)
     split_root = input_root / split
+    source_errors = _read_source_errors(split_root)
     dataset_root = output_root if flat_output else output_root / split
     preexisting_output = dataset_root.exists()
     if preexisting_output and not overwrite and not resume:
@@ -288,6 +293,7 @@ def convert_dataset(
         single_floor=single_floor,
         eligible_episodes=eligible_episodes,
         skipped=skipped,
+        source_error_count=len(source_errors),
         max_episodes=max_episodes,
         num_workers=num_workers,
     )
@@ -306,31 +312,16 @@ def _scan_source(
     annotation_index: dict[str, dict[str, str]] | None,
 ) -> list[SourceEpisode]:
     manifest_path = split_root / "manifest.jsonl"
-    errors_path = split_root / "errors.jsonl"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"missing replay manifest: {manifest_path}")
-    if not errors_path.is_file():
-        raise FileNotFoundError(f"missing replay errors file: {errors_path}")
-    source_errors = _read_jsonl(errors_path)
-    if source_errors:
-        raise SourceSchemaError(
-            f"source replay has {len(source_errors)} recorded errors: {errors_path}"
-        )
     manifest = _read_jsonl(manifest_path)
     if not manifest:
         raise SourceSchemaError(f"empty replay manifest: {manifest_path}")
 
-    expected_dataset, expected_role = (
-        ("r2r", None) if dataset_name == "r2r" else ("rxr", "guide")
-    )
     candidates: list[SourceEpisode] = []
     iterator = tqdm(manifest, desc=f"Preflight {dataset_name}/{split}", unit="episode")
     for manifest_index, row in enumerate(iterator):
-        if row.get("dataset") != expected_dataset or row.get("role") != expected_role:
-            raise SourceSchemaError(
-                f"manifest row {manifest_index} dataset/role mismatch: "
-                f"{row.get('dataset')!r}/{row.get('role')!r}"
-            )
+        _validate_source_identity(row, dataset_name, manifest_index)
         if row.get("split") != split:
             raise SourceSchemaError(
                 f"manifest row {manifest_index} split mismatch: {row.get('split')!r}"
@@ -368,6 +359,13 @@ def _scan_source(
     return candidates
 
 
+def _read_source_errors(split_root: Path) -> list[dict[str, Any]]:
+    errors_path = split_root / "errors.jsonl"
+    if not errors_path.is_file():
+        raise FileNotFoundError(f"missing replay errors file: {errors_path}")
+    return _read_jsonl(errors_path)
+
+
 def _scan_manifest_fast(
     split_root: Path,
     *,
@@ -387,16 +385,9 @@ def _scan_manifest_fast(
     manifest = _read_jsonl(manifest_path)
     if not manifest:
         raise SourceSchemaError(f"empty replay manifest: {manifest_path}")
-    expected_dataset, expected_role = (
-        ("r2r", None) if dataset_name == "r2r" else ("rxr", "guide")
-    )
     candidates: list[SourceEpisode] = []
     for manifest_index, row in enumerate(manifest):
-        if row.get("dataset") != expected_dataset or row.get("role") != expected_role:
-            raise SourceSchemaError(
-                f"manifest row {manifest_index} dataset/role mismatch: "
-                f"{row.get('dataset')!r}/{row.get('role')!r}"
-            )
+        _validate_source_identity(row, dataset_name, manifest_index)
         if row.get("split") != split:
             raise SourceSchemaError(
                 f"manifest row {manifest_index} split mismatch: {row.get('split')!r}"
@@ -736,6 +727,7 @@ def _write_final_metadata(
     single_floor: list[SourceEpisode],
     eligible_episodes: list[ConversionEpisode],
     skipped: list[SourceEpisode],
+    source_error_count: int,
     max_episodes: int | None,
     num_workers: int,
 ) -> None:
@@ -817,6 +809,7 @@ def _write_final_metadata(
         "episode_unit": "one_source_instruction",
         "rxr_languages": list(RXR_ENGLISH_LANGUAGES) if dataset_name == "rxr_guide" else None,
         "source_manifest_total": len(candidates),
+        "source_recorded_errors": source_error_count,
         "source_instruction_total": sum(
             candidate.source_instruction_count for candidate in candidates
         ),
@@ -841,7 +834,8 @@ def _write_final_metadata(
         "errors": 0,
         "max_episodes": max_episodes,
         "num_workers": num_workers,
-        "complete_source_conversion": max_episodes is None,
+        "complete_success_manifest_conversion": max_episodes is None,
+        "complete_source_conversion": max_episodes is None and source_error_count == 0,
     }
     _write_json_atomic(meta / "conversion_report.json", report)
     _write_json_atomic(meta / "modality.json", build_modality())
@@ -898,6 +892,17 @@ def _validate_episode_identity(
             raise SourceSchemaError(
                 f"manifest row {manifest_index} disagrees with episode.json for {key!r}"
             )
+
+
+def _validate_source_identity(
+    manifest: dict[str, Any], dataset_name: str, manifest_index: int
+) -> None:
+    identity = (manifest.get("dataset"), manifest.get("role"))
+    if identity not in EXPECTED_SOURCE_IDENTITIES[dataset_name]:
+        raise SourceSchemaError(
+            f"manifest row {manifest_index} dataset/role mismatch: "
+            f"{identity[0]!r}/{identity[1]!r}"
+        )
 
 
 def _validate_selected_instruction(
